@@ -1,0 +1,51 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+- Testing
+- Main_main
+- Development
+
+pool:
+  name: 'LatestBuildPool'
+
+steps:
+- checkout: self
+  fetchDepth: 0
+  persistCredentials: true
+
+# - task: SonarQubePrepare@5
+#   condition: and(succeeded(), eq(variables['Build.SourceBranchName'], 'Main_main'))
+#   inputs:
+#     SonarQube: 'Python_Unified_BI'
+#     scannerMode: 'CLI'
+#     configMode: 'manual'
+#     cliProjectKey: 'Python_Unified_BI_Python_Unified_BI_1278e15c-4710-4730-9c89-cd074ebb8a8b'
+#     cliProjectName: 'Python_Unified_BI'
+#     cliSources: '.'
+#     extraProperties: |
+#       sonar.host.url=http://192.168.222.47:9000
+#       sonar.qualitygate.wait=true
+
+# - task: SonarQubeAnalyze@5
+#   condition: and(succeeded(), eq(variables['Build.SourceBranchName'], 'Main_main'))
+#   inputs:
+#     jdkversion: 'JAVA_HOME_17_X64'      
+
+- task: ArchiveFiles@2
+  displayName: 'Archive Files'
+  inputs:
+    rootFolderOrFile: '$(System.DefaultWorkingDirectory)'
+    includeRootFolder: false
+    archiveType: 'zip'
+    archiveFile: '$(Build.ArtifactStagingDirectory)/app.zip'
+    replaceExistingArchive: true
+
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+    ArtifactName: 'drop'
+    publishLocation: 'Container'
+

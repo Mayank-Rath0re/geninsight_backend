@@ -1,0 +1,9 @@
+fastapi
+python-dotenv
+pymssql
+pandas
+google-genai
+pydantic
+python-multipart
+uvicorn
+groq

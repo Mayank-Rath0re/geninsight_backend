@@ -143,7 +143,8 @@ async def upload_dataset(userId: int, apply_basic_transformation: bool = False, 
         # 4. Build metadata & knowledge base from the sanitized df
         metadata = transform_handler.extract_metadata(file_path)
         roles    = transform_handler.classify_column_roles(df, metadata)
-        kb       = transform_handler.build_knowledge_base(df, metadata, table_name, roles)
+        print("=== CALLING AI: Building Knowledge Base")
+        kb       = transform_handler.build_knowledge_base(df.head(5), metadata, table_name, roles)
         del df
 
         # ── Single transaction: schema + data insert + table_info insert ──
@@ -397,21 +398,15 @@ def transform_table(payload: models.TransformPayload):
             # Build {name: knowledgebase} dict for parse_query_intent
             tables_data = {row[1]: row[3] for row in tables_rows}
 
-            # build_sys_prompt expects "Name" and "KnowledgeBase" (capital keys)
             tables_info = [
                 {
-                    "Name":          row[1],
-                    "KnowledgeBase": row[3],
                     "user_id":       row[2],
-                    "knowledgebase": row[3],   # kept lowercase for table_string()
+                    "knowledgebase": row[3],   
                     "metadata":      row[4],
-                    "name":          row[1],   # kept lowercase for table_string()
+                    "name":          row[1],
                 }
                 for row in tables_rows
             ]
-
-            # 4. Parse query intent
-            query_intent = transform_handler.parse_query_intent(payload.prompt, tables_data)
 
             # 5. Fetch the most recent query in this session (if any)
             previous_query_data = None
@@ -439,7 +434,6 @@ def transform_table(payload: models.TransformPayload):
             query_result = transform_handler.get_sql_query(
                 payload.prompt,
                 tables_info,
-                query_intent,
                 previous_query_data,
             )
 

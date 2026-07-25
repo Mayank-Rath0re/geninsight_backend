@@ -228,7 +228,7 @@ SAMPLE ROWS (first 5):
 Return exactly this JSON structure (fill in values, keep all keys):
 {{
   "columns_name": {json.dumps(cols)},
-  "dataset_name": "{table_name}",
+  "table_name": "{table_name}",
   "domain": "infer from data e.g. sales, finance, healthcare",
   "description": "2-3 sentence plain-English description of the dataset",
   "row_count": {df.shape[0]},
@@ -240,6 +240,8 @@ Return exactly this JSON structure (fill in values, keep all keys):
   "data_quality_notes": "brief note on nulls, outliers, or data issues",
   "potential_analyses": ["3-5 analysis ideas this data supports"]
 }}"""
+    chars = len(system) + len(user)
+    print(f"---AI Called for Build_Knowledge_Base: {chars} characters or {chars/4} tokens roughly")
 
     raw = llm_handler.ask_llm(system, user)
 
@@ -247,69 +249,6 @@ Return exactly this JSON structure (fill in values, keep all keys):
     kb_dict["column_roles"] = json.loads(roles)       # roles is a JSON string, parse it
 
     return json.dumps(kb_dict)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Parse Query Intent
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_query_intent(
-    user_prompt: str,
-    knowledge_base: Dict[str, str],
-) -> Dict[str, Any]:
-    tables_context = []
-    for key in knowledge_base:
-        tables_context.append({
-            "table_name": key,
-            "table_knowledge_base": knowledge_base[key]
-        })
-    kb_desc = json.dumps(tables_context, indent=2)
-
-    system = (
-        "You are a BI requirements analyst. "
-        "Respond with ONLY a single raw JSON object — no markdown fences, "
-        "no explanation, no preamble. "
-        "The response must be directly parseable by json.loads()."
-    )
-
-    user = f"""USER PROMPT: {user_prompt}
-
-DATASET CONTEXT:
-{kb_desc}
-
-The user may want to join, compare, or aggregate across multiple tables.
-Each field referencing a column MUST be prefixed with its table name
-using dot notation, e.g. "orders.revenue" or "customers.region".
-
-Return exactly this JSON structure:
-{{
-  "intent_type": "dashboard | transformed_data | query_result | hybrid",
-  "needs_dashboard": true,
-  "needs_transformed_data": true,
-  "needs_query_result": false,
-  "charts_requested": [
-    {{"chart_type": "bar|line|pie|scatter|heatmap|table", "x_axis": "col", "y_axis": "col", "title": "chart title", "rationale": "why"}}
-  ],
-  "filters": [
-    {{"column": "col", "condition": "e.g. > 0 or = Active"}}
-  ],
-  "aggregations": [
-    {{"column": "col", "function": "sum|mean|count|max|min", "group_by": "col or null"}}
-  ],
-  "transformation_requests": [
-    "plain-English description of each transformation the user asked for"
-  ],
-  "kpis": [
-    {{"name": "KPI name", "description": "what it measures"}}
-  ],
-  "time_dimension": "date column for time series, or null",
-  "summary": "one sentence summary of what the user wants"
-}}"""
-
-    raw    = llm_handler.ask_llm(system, user)
-    intent = helper.extract_json_object(raw)
-    return intent
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Basic Transform
@@ -381,11 +320,11 @@ def build_sys_prompt(tables_info: dict, table_cols: dict) -> str:
     def build_tables_block():
         blocks = []
         for t in tables:
-            kb = json.loads(t["KnowledgeBase"])
+            kb = json.loads(t["knowledgebase"])
             col_roles = {k: v for k, v in kb.items() if isinstance(v, dict) and "role" in v}
             cols = kb.get("columns_name", [])
             lines = [
-                f"Table [{t['Name']}]:",
+                f"Table [{t['name']}]:",
                 f"  columns: {cols}",
                 f"  column roles:",
             ]
@@ -404,7 +343,7 @@ def build_sys_prompt(tables_info: dict, table_cols: dict) -> str:
   If you need a column not listed here, JOIN the base table that contains it."""
 
     pipeline_position = table_cols.get("pipeline_position", "only")
-    table_names = [t["Name"] for t in tables]
+    table_names = [t["name"] for t in tables]
 
     return f"""
 You are a SQL Server query generation assistant. Convert a natural language prompt into a valid SQL Server SELECT query.
@@ -472,37 +411,9 @@ def table_string(table_info: dict):
             knowledge_base: {table_info["knowledgebase"]}\n
 """ 
 
-'''def get_sql_query(
-    user_prompt: str,
-    tables_info: List[str],
-    query_intent: str,
-    previous_query_data: dict = None,
-) -> str:
-    # Fetching the system prompt
-    # Building the user prompt structure
-    sql_user_prompt = ""
-    if previous_query_data != None:
-        sql_user_prompt = f"""
-        Previous Query Info:
-            Summary of Action: {previous_query_data["summary"]}
-            SQL Query Generated: {previous_query_data["sql_query"]}
-            Latest Columns (Post Query Execution): {previous_query_data["updated_columns"]}
-    """ 
-    sql_user_prompt += "\nTables Info:\n"
-    for table in tables_info:
-        sql_user_prompt += table_string(table)
-
-    sql_user_prompt.append(f"""
-    User Prompt: {user_prompt}
-    Query Intent: {query_intent}
-    REMINDER: Use {{prev}} as the FROM source. SELECT * unless aggregating.\n
-""")
-    return helper.sanitize_llm_sql(db_handler.ask_llm(sys_prompt, sql_user_prompt)) ''' 
-
 def get_sql_query(
     user_prompt: str,
     tables_info: list,
-    query_intent: str,
     previous_query_data: dict = None,
 ) -> dict:  # ← now returns dict, not str
 
@@ -527,10 +438,10 @@ Previous Query Info:
 
     sql_user_prompt += f"""
 User Prompt: {user_prompt}
-Query Intent: {query_intent}
 REMINDER: Use {{prev}} as the FROM source. SELECT * unless aggregating.
 """
-
+    characters = len(sql_user_prompt) + len(sys_prompt)
+    print(f"--- SQL QUERY GENERATION CALLED: {characters} characters or {characters/4} tokens roughly")
     raw = llm_handler.ask_llm(sys_prompt, sql_user_prompt)
     print("-- SQL Query Generated: ", raw)
     result = helper.extract_json_object(raw)  # already have this helper

@@ -7,8 +7,9 @@ import logging
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai.errors import APIError as GeminiAPIError
+from openai import OpenAI
+from openai import APIStatusError as OpenRouterAPIStatusError
+from openai import APIConnectionError as OpenRouterAPIConnectionError
 from groq import Groq, APIStatusError, APIConnectionError
 
 # Configure logger
@@ -18,10 +19,15 @@ logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 # --- Config ---
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-GEMINI_MODEL = "gemini-3.5-flash"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_MODEL = "google/gemma-4-31b-it:standard"
+
+# Optional but recommended by OpenRouter for attribution/rankings
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
+OPENROUTER_SITE_NAME = os.getenv("OPENROUTER_SITE_NAME", "")
 
 # Fallback sequence for Groq models to avoid rate-limit locks
 GROQ_MODELS = [
@@ -30,21 +36,30 @@ GROQ_MODELS = [
     "qwen/qwen3-32b"                             # Tertiary fallback
 ]
 
-Provider = Literal["groq", "gemini"]
+Provider = Literal["groq", "openrouter"]
 DEFAULT_PROVIDER: Provider = "groq"
 
 # --- Lazy client singletons ---
-_gemini_client: Optional[genai.Client] = None
+_openrouter_client: Optional[OpenAI] = None
 _groq_client: Optional[Groq] = None
 
 
-def _get_gemini_client() -> genai.Client:
-    global _gemini_client
-    if _gemini_client is None:
-        if not GOOGLE_API_KEY:
-            raise RuntimeError("CRITICAL: GOOGLE_API_KEY environment variable is missing")
-        _gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
-    return _gemini_client
+def _get_openrouter_client() -> OpenAI:
+    global _openrouter_client
+    if _openrouter_client is None:
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError("CRITICAL: OPENROUTER_API_KEY environment variable is missing")
+        default_headers = {}
+        if OPENROUTER_SITE_URL:
+            default_headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+        if OPENROUTER_SITE_NAME:
+            default_headers["X-Title"] = OPENROUTER_SITE_NAME
+        _openrouter_client = OpenAI(
+            base_url=OPENROUTER_BASE_URL,
+            api_key=OPENROUTER_API_KEY,
+            default_headers=default_headers or None,
+        )
+    return _openrouter_client
 
 
 def _get_groq_client() -> Groq:
@@ -58,46 +73,48 @@ def _get_groq_client() -> Groq:
 
 def _resolve_provider(activate: Optional[Provider]) -> Provider:
     provider = activate or DEFAULT_PROVIDER
-    if provider not in ("groq", "gemini"):
-        raise ValueError(f"Unknown provider '{provider}'. Expected 'groq' or 'gemini'.")
+    if provider not in ("groq", "openrouter"):
+        raise ValueError(f"Unknown provider '{provider}'. Expected 'groq' or 'openrouter'.")
     return provider
 
 
-# --- Gemini backends ---
-def _generate_response_gemini(prompt: str) -> str:
+# --- OpenRouter backends ---
+def _generate_response_openrouter(prompt: str) -> str:
     try:
-        response = _get_gemini_client().models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
+        completion = _get_openrouter_client().chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
         )
-        if not response.text:
-            raise ValueError("Gemini returned an empty response.")
-        return response.text
-    except GeminiAPIError as e:
-        logger.error(f"Gemini API Error: {e}")
+        content = completion.choices[0].message.content
+        if not content:
+            raise ValueError("OpenRouter returned an empty response.")
+        return content
+    except (OpenRouterAPIStatusError, OpenRouterAPIConnectionError) as e:
+        logger.error(f"OpenRouter API Error: {e}")
         raise
     except Exception as e:
-        logger.error(f"Unexpected error in Gemini backend: {e}")
+        logger.error(f"Unexpected error in OpenRouter backend: {e}")
         raise
 
 
-def _ask_llm_gemini(system_prompt: str, user_prompt: str) -> str:
+def _ask_llm_openrouter(system_prompt: str, user_prompt: str) -> str:
     try:
-        response = _get_gemini_client().models.generate_content(
-            model=GEMINI_MODEL,
-            contents=user_prompt,
-            config=genai.types.GenerateContentConfig(
-                system_instruction=system_prompt,
-            ),
+        completion = _get_openrouter_client().chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
         )
-        if not response.text:
-            raise ValueError("Gemini returned an empty response.")
-        return response.text
-    except GeminiAPIError as e:
-        logger.error(f"Gemini API Error: {e}")
+        content = completion.choices[0].message.content
+        if not content:
+            raise ValueError("OpenRouter returned an empty response.")
+        return content
+    except (OpenRouterAPIStatusError, OpenRouterAPIConnectionError) as e:
+        logger.error(f"OpenRouter API Error: {e}")
         raise
     except Exception as e:
-        logger.error(f"Unexpected error in Gemini backend: {e}")
+        logger.error(f"Unexpected error in OpenRouter backend: {e}")
         raise
 
 
@@ -184,14 +201,14 @@ def generate_response(prompt: str, activate: Optional[Provider] = None) -> str:
         try:
             return _generate_response_groq(prompt)
         except Exception as e:
-            logger.error(f"Groq run failed: {e}. Cascading to Gemini fallback...")
-            return _generate_response_gemini(prompt)
+            logger.error(f"Groq run failed: {e}. Cascading to OpenRouter fallback...")
+            return _generate_response_openrouter(prompt)
             
-    # Default path for Gemini
+    # Default path for OpenRouter
     try:
-        return _generate_response_gemini(prompt)
+        return _generate_response_openrouter(prompt)
     except Exception as e:
-        logger.error(f"Gemini run failed: {e}. Cascading to Groq fallback...")
+        logger.error(f"OpenRouter run failed: {e}. Cascading to Groq fallback...")
         return _generate_response_groq(prompt)
 
 
@@ -206,12 +223,12 @@ def ask_llm(system_prompt: str, user_prompt: str, activate: Optional[Provider] =
         try:
             return _ask_llm_groq(system_prompt, user_prompt)
         except Exception as e:
-            logger.error(f"Groq run failed: {e}. Cascading to Gemini fallback...")
-            return _ask_llm_gemini(system_prompt, user_prompt)
+            logger.error(f"Groq run failed: {e}. Cascading to OpenRouter fallback...")
+            return _ask_llm_openrouter(system_prompt, user_prompt)
             
-    # Default path for Gemini
+    # Default path for OpenRouter
     try:
-        return _ask_llm_gemini(system_prompt, user_prompt)
+        return _ask_llm_openrouter(system_prompt, user_prompt)
     except Exception as e:
-        logger.error(f"Gemini run failed: {e}. Cascading to Groq fallback...")
+        logger.error(f"OpenRouter run failed: {e}. Cascading to Groq fallback...")
         return _ask_llm_groq(system_prompt, user_prompt)

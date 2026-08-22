@@ -1,42 +1,32 @@
-# db_handler.py
+# core/db.py
+"""
+Database access layer (was db_handler.py).
 
-import logging
-import os
-import sys
+Every function opens its own connection and closes it in a `finally` block
+rather than relying on pymssql.Connection's `with conn:` protocol — that
+protocol does not reliably close the underlying socket across
+pymssql/FreeTDS versions, and behind a tunnel/proxy, connections are held
+open long enough that leaked ones exhaust the SQL Server connection pool
+and cause intermittent timeouts on unrelated endpoints.
+"""
+
 import csv
+import logging
 from contextlib import contextmanager
 from typing import Any, List, Optional
 
 import pymssql
-from dotenv import load_dotenv
+
+from core.config import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_DATABASE
 
 logger = logging.getLogger(__name__)
-load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-try:
-    DB_HOST     = os.getenv("DB_HOST")
-    DB_USER     = os.getenv("DB_USER")
-    DB_PASSWORD = os.getenv("DB_PASSWORD")
-    DB_DATABASE = os.getenv("DB_DATABASE")
-
-    db_port_env = os.getenv("DB_PORT")
-    if not db_port_env:
-        raise ValueError("DB_PORT environment variable is missing.")
-    DB_PORT = int(db_port_env)
-
-except (ValueError, TypeError) as e:
-    logger.critical(f"Database credentials error: {e}")
-    sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Connection factory
 # ---------------------------------------------------------------------------
 
-def get_db_connection() -> pymssql.Connection:
+def get_connection() -> pymssql.Connection:
     return pymssql.connect(
         server=DB_HOST,
         port=DB_PORT,
@@ -47,8 +37,9 @@ def get_db_connection() -> pymssql.Connection:
         autocommit=False,
     )
 
+
 # ---------------------------------------------------------------------------
-# Transaction context manager  ← new addition
+# Transaction context manager
 # ---------------------------------------------------------------------------
 
 @contextmanager
@@ -57,13 +48,13 @@ def transaction():
     Yield a cursor bound to a single connection/transaction.
 
     Usage:
-        with db_handler.transaction() as cur:
+        with db.transaction() as cur:
             cur.execute(...)
             cur.execute(...)
         # commits on success, rolls back on any exception
     """
-    conn = get_db_connection()
-    cur  = conn.cursor()
+    conn = get_connection()
+    cur = conn.cursor()
     try:
         yield cur
         conn.commit()
@@ -74,38 +65,43 @@ def transaction():
         cur.close()
         conn.close()
 
+
 # ---------------------------------------------------------------------------
-# Existing functions — names unchanged, internals fixed
+# Query helpers
 # ---------------------------------------------------------------------------
 
 def check_login_credentials(email: str, password: str) -> bool:
-    # Fixed: connection was never closed in the original
-    with get_db_connection() as conn:
+    conn = get_connection()
+    try:
         cur = conn.cursor()
         cur.execute("SELECT password FROM auth WHERE email = %s", (email,))
         row = cur.fetchone()
         cur.close()
+    finally:
+        conn.close()
     return row is not None and password == row[0]
 
 
-def get_single_value_db(query: str, params: tuple = None) -> Any:
-    # Unchanged behaviour, just uses context manager to guarantee connection closes
-    with get_db_connection() as conn:
+def get_single_value(query: str, params: tuple = None) -> Any:
+    conn = get_connection()
+    try:
         cur = conn.cursor()
         cur.execute(query, params or ())
         row = cur.fetchone()
         cur.close()
         conn.commit()
+    finally:
+        conn.close()
     return row[0] if row else None
 
 
-def run_fetch_query(
+def fetch(
     query: str,
     params: tuple = None,
     limit: Optional[int] = None,
     offset: Optional[int] = None,
-):
-    # Fixed: return type is now always list[list] — no more shape-dependent scalar collapse
+) -> List[list]:
+    """Always returns list[list] — no shape-dependent scalar collapse."""
     if limit is not None and limit < 0:
         raise ValueError("limit must be a non-negative integer.")
     if offset is not None and offset < 0:
@@ -116,21 +112,25 @@ def run_fetch_query(
         q += f" OFFSET {offset or 0} ROWS FETCH NEXT {limit} ROWS ONLY"
     q += ";"
 
-    with get_db_connection() as conn:
+    conn = get_connection()
+    try:
         cur = conn.cursor()
         cur.execute(q, params or ())
         rows = cur.fetchall()
         cur.close()
+    finally:
+        conn.close()
 
     return [list(row) for row in rows] if rows else []
 
-def run_fetch_query_with_columns(
+
+def fetch_with_columns(
     query: str,
     params: tuple = None,
     limit: Optional[int] = None,
     offset: Optional[int] = None,
-):
-    """Like run_fetch_query, but also returns column names from cur.description."""
+) -> dict:
+    """Like fetch(), but also returns column names from cur.description."""
     if limit is not None and limit < 0:
         raise ValueError("limit must be a non-negative integer.")
     if offset is not None and offset < 0:
@@ -141,12 +141,15 @@ def run_fetch_query_with_columns(
         q += f" OFFSET {offset or 0} ROWS FETCH NEXT {limit} ROWS ONLY"
     q += ";"
 
-    with get_db_connection() as conn:
+    conn = get_connection()
+    try:
         cur = conn.cursor()
         cur.execute(q, params or ())
         columns = [desc[0] for desc in cur.description] if cur.description else []
         rows = cur.fetchall()
         cur.close()
+    finally:
+        conn.close()
 
     return {
         "columns": columns,
@@ -154,35 +157,43 @@ def run_fetch_query_with_columns(
     }
 
 
-def run_insert_query(query: str, params: tuple = None) -> int:
-    # Fixed: removed @@IDENTITY — OUTPUT INSERTED.id in the query itself is reliable
-    with get_db_connection() as conn:
+def insert(query: str, params: tuple = None) -> int:
+    """Expects the query to contain `OUTPUT INSERTED.<col>` — no @@IDENTITY needed."""
+    conn = get_connection()
+    try:
         cur = conn.cursor()
         cur.execute(query, params or ())
         row = cur.fetchone()
         conn.commit()
         cur.close()
+    finally:
+        conn.close()
     return row[0] if row else -1
 
 
-def run_query(query: str, params: tuple = None) -> bool:
-    # Fixed: cursor was never closed in the original
-    with get_db_connection() as conn:
+def run(query: str, params: tuple = None) -> bool:
+    conn = get_connection()
+    try:
         cur = conn.cursor()
         cur.execute(query, params or ())
         conn.commit()
         cur.close()
+    finally:
+        conn.close()
     return True
 
 
 # ---------------------------------------------------------------------------
-# Schema helpers — unchanged
+# Schema helpers
 # ---------------------------------------------------------------------------
 
 def _python_type_to_sql_type(value) -> str:
-    if isinstance(value, bool):  return "BIT"
-    if isinstance(value, int):   return "BIGINT"
-    if isinstance(value, float): return "FLOAT"
+    if isinstance(value, bool):
+        return "BIT"
+    if isinstance(value, int):
+        return "BIGINT"
+    if isinstance(value, float):
+        return "FLOAT"
     if isinstance(value, str):
         return "NVARCHAR(255)" if len(value) <= 255 else "NVARCHAR(MAX)"
     return "NVARCHAR(MAX)"
@@ -198,7 +209,7 @@ def generate_sql_schema(table_name: str, file_path: str) -> str:
             f"CREATE TABLE [{table_name}] ([id] INT IDENTITY(1,1) PRIMARY KEY);"
         )
 
-    columns  = list(rows[0].keys())
+    columns = list(rows[0].keys())
     col_defs: List[str] = []
 
     pk_col = ""
@@ -214,12 +225,14 @@ def generate_sql_schema(table_name: str, file_path: str) -> str:
 
     for col in columns:
         samples = [r[col] for r in rows if r[col] != ""]
-        sample  = samples[0] if samples else ""
+        sample = samples[0] if samples else ""
         try:
-            int(sample);   sql_type = "BIGINT"
+            int(sample)
+            sql_type = "BIGINT"
         except ValueError:
             try:
-                float(sample); sql_type = "FLOAT"
+                float(sample)
+                sql_type = "FLOAT"
             except ValueError:
                 sql_type = _python_type_to_sql_type(sample)
 

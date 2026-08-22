@@ -1,43 +1,39 @@
-# llm_handler.py
+# services/llm_client.py
+"""
+LLM client (was llm_handler.py).
+
+NOTE: The original file also defined `generate_response()` (a single-prompt,
+no-system-message variant) and its `_generate_response_groq` /
+`_generate_response_openrouter` backends. Nothing in the codebase called
+`generate_response` — every call site uses `ask_llm(system, user)` — so
+that unused path has been removed here. If a single-prompt variant is
+needed later, it can be re-added as `ask_llm(system_prompt="", ...)`.
+"""
 
 from __future__ import annotations
 
-import os
 import logging
 from typing import Literal, Optional
 
-from dotenv import load_dotenv
 from openai import OpenAI
 from openai import APIStatusError as OpenRouterAPIStatusError
 from openai import APIConnectionError as OpenRouterAPIConnectionError
 from groq import Groq, APIStatusError, APIConnectionError
 
-# Configure logger
-logger = logging.getLogger("llm_handler")
-logging.basicConfig(level=logging.INFO)
+from core.config import (
+    OPENROUTER_API_KEY,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_MODEL,
+    OPENROUTER_SITE_URL,
+    OPENROUTER_SITE_NAME,
+    GROQ_API_KEY,
+    GROQ_MODELS,
+    DEFAULT_LLM_PROVIDER,
+)
 
-load_dotenv()
-
-# --- Config ---
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL = "google/gemma-4-31b-it:standard"
-
-# Optional but recommended by OpenRouter for attribution/rankings
-OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
-OPENROUTER_SITE_NAME = os.getenv("OPENROUTER_SITE_NAME", "")
-
-# Fallback sequence for Groq models to avoid rate-limit locks
-GROQ_MODELS = [
-    "llama-3.3-70b-versatile",                       # Primary (Flagship reasoning)
-    "meta-llama/llama-4-scout-17b-16e-instruct", # Secondary (High TPM headroom)
-    "qwen/qwen3-32b"                             # Tertiary fallback
-]
+logger = logging.getLogger("llm_client")
 
 Provider = Literal["groq", "openrouter"]
-DEFAULT_PROVIDER: Provider = "groq"
 
 # --- Lazy client singletons ---
 _openrouter_client: Optional[OpenAI] = None
@@ -72,30 +68,13 @@ def _get_groq_client() -> Groq:
 
 
 def _resolve_provider(activate: Optional[Provider]) -> Provider:
-    provider = activate or DEFAULT_PROVIDER
+    provider = activate or DEFAULT_LLM_PROVIDER
     if provider not in ("groq", "openrouter"):
         raise ValueError(f"Unknown provider '{provider}'. Expected 'groq' or 'openrouter'.")
     return provider
 
 
-# --- OpenRouter backends ---
-def _generate_response_openrouter(prompt: str) -> str:
-    try:
-        completion = _get_openrouter_client().chat.completions.create(
-            model=OPENROUTER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        content = completion.choices[0].message.content
-        if not content:
-            raise ValueError("OpenRouter returned an empty response.")
-        return content
-    except (OpenRouterAPIStatusError, OpenRouterAPIConnectionError) as e:
-        logger.error(f"OpenRouter API Error: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in OpenRouter backend: {e}")
-        raise
-
+# --- OpenRouter backend ---
 
 def _ask_llm_openrouter(system_prompt: str, user_prompt: str) -> str:
     try:
@@ -118,42 +97,40 @@ def _ask_llm_openrouter(system_prompt: str, user_prompt: str) -> str:
         raise
 
 
-# --- Groq backends with dynamic fallback and adaptive token budgeting ---
+# --- Groq backend with dynamic fallback and adaptive token budgeting ---
+
 def _execute_groq_completion(messages: list[dict[str, str]]) -> str:
-    """Executes a Groq chat completion.
-    
-    Iterates through candidate models and scales down max_completion_tokens 
+    """
+    Iterates through candidate models and scales down max_completion_tokens
     if a rate limit (status 413 or 429) is hit.
     """
     last_exception = None
-    
+
     for model in GROQ_MODELS:
-        # Dynamically allocate token budget:
-        # For gpt-oss-120b (8k TPM limit), we must restrict max_completion_tokens 
-        # to prevent immediate "Request too large" API rejection.
+        # gpt-oss-120b-class models have an 8k TPM limit, so we restrict
+        # max_completion_tokens for large models to avoid immediate
+        # "Request too large" API rejection.
         is_large_model = "70b" in model
         max_tokens = 1500 if is_large_model else 4096
-        
+
         try:
             logger.info(f"Attempting Groq completion with model: {model} (max_tokens: {max_tokens})")
             completion = _get_groq_client().chat.completions.create(
                 model=model,
                 messages=messages,
-                temperature=0.7, # Slightly lower for more consistent, production-safe outputs
+                temperature=0.7,  # slightly lower for consistent, production-safe outputs
                 max_completion_tokens=max_tokens,
                 top_p=1,
-                #reasoning_effort="medium" if is_large_model else None, # Only supported on reasoning models
                 stream=False,
                 stop=None,
             )
-            
+
             content = completion.choices[0].message.content
             if not content:
                 raise ValueError(f"Groq model {model} returned an empty response.")
             return content
 
         except APIStatusError as e:
-            # Catch 413 (Payload/Request Too Large) or 429 (Rate Limit / TPM exceeded)
             if e.status_code in (413, 429):
                 logger.warning(
                     f"Groq model {model} hit limits (Status {e.status_code}). "
@@ -161,9 +138,8 @@ def _execute_groq_completion(messages: list[dict[str, str]]) -> str:
                 )
                 last_exception = e
                 continue
-            else:
-                logger.error(f"Groq API Error status {e.status_code}: {e.message}")
-                raise e
+            logger.error(f"Groq API Error status {e.status_code}: {e.message}")
+            raise e
         except APIConnectionError as e:
             logger.warning(f"Groq network connection failed for model {model}: {e}. Retrying next model...")
             last_exception = e
@@ -175,11 +151,6 @@ def _execute_groq_completion(messages: list[dict[str, str]]) -> str:
     raise RuntimeError(f"All configured Groq models failed. Last error: {last_exception}")
 
 
-def _generate_response_groq(prompt: str) -> str:
-    messages = [{"role": "user", "content": prompt}]
-    return _execute_groq_completion(messages)
-
-
 def _ask_llm_groq(system_prompt: str, user_prompt: str) -> str:
     messages = [
         {"role": "system", "content": system_prompt},
@@ -188,45 +159,23 @@ def _ask_llm_groq(system_prompt: str, user_prompt: str) -> str:
     return _execute_groq_completion(messages)
 
 
-# --- Public Resilient API ---
-def generate_response(prompt: str, activate: Optional[Provider] = None) -> str:
-    """Generates a standard response using the selected provider.
-    
-    If the primary provider fails, automatically falls back to the other
-    to guarantee high-availability.
-    """
-    provider = _resolve_provider(activate)
-    
-    if provider == "groq":
-        try:
-            return _generate_response_groq(prompt)
-        except Exception as e:
-            logger.error(f"Groq run failed: {e}. Cascading to OpenRouter fallback...")
-            return _generate_response_openrouter(prompt)
-            
-    # Default path for OpenRouter
-    try:
-        return _generate_response_openrouter(prompt)
-    except Exception as e:
-        logger.error(f"OpenRouter run failed: {e}. Cascading to Groq fallback...")
-        return _generate_response_groq(prompt)
-
+# --- Public API ---
 
 def ask_llm(system_prompt: str, user_prompt: str, activate: Optional[Provider] = None) -> str:
-    """Generates a structured response using the selected provider.
-    
-    If the primary provider fails, automatically falls back to the other.
+    """
+    Generates a structured response using the selected provider. If the
+    primary provider fails, automatically falls back to the other for
+    high availability.
     """
     provider = _resolve_provider(activate)
-    
+
     if provider == "groq":
         try:
             return _ask_llm_groq(system_prompt, user_prompt)
         except Exception as e:
             logger.error(f"Groq run failed: {e}. Cascading to OpenRouter fallback...")
             return _ask_llm_openrouter(system_prompt, user_prompt)
-            
-    # Default path for OpenRouter
+
     try:
         return _ask_llm_openrouter(system_prompt, user_prompt)
     except Exception as e:

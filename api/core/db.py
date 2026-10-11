@@ -1,13 +1,6 @@
 # core/db.py
 """
-Database access layer (was db_handler.py).
-
-Every function opens its own connection and closes it in a `finally` block
-rather than relying on pymssql.Connection's `with conn:` protocol — that
-protocol does not reliably close the underlying socket across
-pymssql/FreeTDS versions, and behind a tunnel/proxy, connections are held
-open long enough that leaked ones exhaust the SQL Server connection pool
-and cause intermittent timeouts on unrelated endpoints.
+Database access layer
 """
 
 import csv
@@ -69,18 +62,6 @@ def transaction():
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
-
-def check_login_credentials(email: str, password: str) -> bool:
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT password FROM auth WHERE email = %s", (email,))
-        row = cur.fetchone()
-        cur.close()
-    finally:
-        conn.close()
-    return row is not None and password == row[0]
-
 
 def get_single_value(query: str, params: tuple = None) -> Any:
     conn = get_connection()

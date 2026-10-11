@@ -1,12 +1,6 @@
 # core/config.py
 """
 Single source of truth for environment configuration.
-
-Previously DB credentials were read directly inside db_handler.py and LLM
-API keys were read directly inside llm_handler.py, with no shared place to
-see what env vars the app depends on. Centralizing them here also lets
-config validation fail fast on startup with one clear error instead of
-wherever the first DB/LLM call happens to occur.
 """
 
 import logging
@@ -51,12 +45,11 @@ OPENROUTER_SITE_NAME = os.getenv("OPENROUTER_SITE_NAME", "")
 
 # Fallback sequence for Groq models, ordered to avoid rate-limit locks
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",                    # Primary (flagship reasoning)
-    "meta-llama/llama-4-scout-17b-16e-instruct",   # Secondary (high TPM headroom)
-    "qwen/qwen3-32b",                              # Tertiary fallback
+    "qwen/qwen3.8-27b",      # Primary (flagship reasoning)
+    "openai/gpt-oss-120b",   # Secondary (high TPM headroom)
 ]
 
-DEFAULT_LLM_PROVIDER = "openrouter"  # "groq" | "openrouter"
+DEFAULT_LLM_PROVIDER = "groq"  # "groq" | "openrouter"
 
 # ---------------------------------------------------------------------------
 # Auth (JWT)
@@ -68,12 +61,6 @@ JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 if not JWT_SECRET_KEY:
     logger.critical("JWT_SECRET_KEY environment variable is missing.")
     sys.exit(1)
-
-# ---------------------------------------------------------------------------
-# Email (Resend / OTP)
-# ---------------------------------------------------------------------------
-
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 
 # ---------------------------------------------------------------------------
 # Uploads

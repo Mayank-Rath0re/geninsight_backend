@@ -1,12 +1,14 @@
-# services/query_generation.py
 """
-Two-stage natural-language-to-SQL generation (was
-query_generation_instructions / get_sql_query / sanitize_llm_sql, split
-across transform_handler.py and helper.py).
+Two-stage natural-language-to-SQL generation.
 
 Stage 1 (plan): reason about correctness and risk (division by zero,
 join fan-out, ambiguous GROUP BY, etc.) as an explicit JSON plan.
 Stage 2 (generate): mechanically translate that plan into SQL Server SQL.
+
+REVERTED: this was briefly collapsed into a single AI call to cut cost,
+but that caused real reliability regressions in production, so it's back
+to the original two-call plan-then-generate flow. Cost savings elsewhere
+(session creation, knowledge base call) stand; this one didn't pay off.
 """
 
 import json
@@ -16,28 +18,12 @@ from core import json_utils
 from services import llm_client
 
 
-# ─────────────────────────────────────────────────────────────────────────
-#  SQL text cleanup (was helper.sanitize_llm_sql)
-# ─────────────────────────────────────────────────────────────────────────
-
 def sanitize_llm_sql(sql: str) -> str:
     """
     Light, format-only cleanup of LLM-returned SQL. Deliberately does NOT
-    attempt to judge or rewrite query *logic* (e.g. guessing whether a
-    column list is "narrowing" and should become SELECT *) — that kind of
-    regex-based correctness heuristic caused real bugs where a valid,
-    intentional derived-column query was silently rewritten into a plain
-    SELECT *, discarding the column the user asked for.
-
-    Correctness (does the output schema match what was planned/requested)
-    is instead checked in get_sql_query, by comparing the plan's intended
-    column list against the LLM's own reported `columns` — a structural
-    comparison of two Python lists, not a regex over SQL text.
-
-    This function only:
-      1. Strips markdown fences
-      2. Strips trailing semicolons / surrounding whitespace
-      3. Fixes the literal typo artifact ``SELECT ,`` -> ``SELECT *,``
+    attempt to judge or rewrite query *logic* — correctness is instead
+    checked in get_sql_query by comparing the plan's intended column list
+    against the LLM's own reported columns.
     """
     sql = re.sub(r"```(?:sql)?\s*", "", sql)
     sql = re.sub(r"```", "", sql).strip()
@@ -45,10 +31,6 @@ def sanitize_llm_sql(sql: str) -> str:
     sql = re.sub(r"\bSELECT\s+,", "SELECT *,", sql, flags=re.IGNORECASE)
     return sql
 
-
-# ─────────────────────────────────────────────────────────────────────────
-#  Stage 1: planning
-# ─────────────────────────────────────────────────────────────────────────
 
 def query_generation_instructions(
     user_prompt: str,
@@ -92,7 +74,7 @@ Think carefully about correctness and safety BEFORE the query is written:
   are large, note that in warnings (do NOT invent a LIMIT unless the user asked for one
   or it's necessary defensively — leave that call to the generator).
 - GROUP BY completeness: every non-aggregated selected column must be listed in group_logic.
-- Only reference columns that actually exist in the given schemas / {prev} schema.
+- Only reference columns that actually exist in the given table schemas or the current table schema.
 - If the request cannot be satisfied with available columns, set "feasible": false and
   explain why in "warning" — do not invent columns.
 - Column aliases: if any alias in select_columns/new_columns contains a space or special
@@ -136,10 +118,10 @@ The response must be directly parseable by json.loads().
 """
 
     prev_schema_note = (
-        f"CURRENT {{prev}} SCHEMA (only these columns are available from {{prev}}):\n  {prev_cols}\n"
-        "If a needed column is not in this list, it must come from a JOIN to a base table."
+        f"CURRENT TABLE SCHEMA (after previous step; only these columns are available from the base table):\n  {prev_cols}\n"
+        "If a needed column is not in this list, it must come from a JOIN to another table."
         if prev_cols else
-        "No {prev} in this step — this is the first/only step. Query base tables directly."
+        "This is the first/only step. Query the base tables directly by their table names."
     )
 
     prev_history_note = ""
@@ -153,9 +135,9 @@ PREVIOUS STEP CONTEXT:
 
     user_prompt_full = f"""
 PIPELINE POSITION: {pipeline_position}
-  first  → no {{prev}}, query base tables directly
-  middle → {{prev}} is the primary source, do not select from base tables as primary source
-  only   → standalone, query base tables directly
+  first  → query base tables directly by table name
+  middle → query the base table by its table name; it already reflects the previous step's output
+  only   → standalone, query base tables directly by table name
 
 {prev_schema_note}
 {prev_history_note}
@@ -168,7 +150,7 @@ USER REQUEST: {user_prompt}
 Return exactly this JSON structure (fill in every key; use empty list/string/null where not applicable):
 {{
   "feasible": true,
-  "tables_needed": ["table or {{prev}} names actually required"],
+  "tables_needed": ["table names actually required"],
   "column_plan": {{
     "select_columns": ["exact output columns, in order, including derived/aggregate aliases"],
     "new_columns": [
@@ -205,10 +187,6 @@ Return exactly this JSON structure (fill in every key; use empty list/string/nul
     return plan
 
 
-# ─────────────────────────────────────────────────────────────────────────
-#  Stage 2: SQL generation from the plan
-# ─────────────────────────────────────────────────────────────────────────
-
 def get_sql_query(
     user_prompt: str,
     tables_info: list,
@@ -220,7 +198,6 @@ def get_sql_query(
         "prev_cols": None if previous_query_data is None else previous_query_data["updated_columns"],
     }
 
-    # ── Stage 1: plan / risk analysis ──
     plan = query_generation_instructions(
         user_prompt=user_prompt,
         tables_info=tables_info,
@@ -235,7 +212,6 @@ def get_sql_query(
             "columns": [],
         }
 
-    # ── Stage 2: mechanical SQL generation from the plan ──
     sys_prompt = f"""
 You are a SQL Server query generation assistant. You are given a structured PLAN
 (already reasoned about correctness and risk) and must translate it into a single
@@ -244,9 +220,10 @@ only implement it correctly and safely in SQL.
 
 ━━━ PIPELINE POSITION ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {table_cols["pipeline_position"]}
-  first  → No {{prev}}. Query base tables directly.
-  middle → Use {{prev}} as your primary source. Never query base tables as primary source.
-  only   → Standalone. Query base tables directly.
+  Always reference the base table by its real table name in FROM/JOIN.
+  Never use {{prev}} or any placeholder. For 'middle', the table name
+  already represents the previous step's output, so the available
+  columns are those listed in the previous step's schema.
 
 ━━━ RISK CHECKS TO IMPLEMENT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Apply every item below as a concrete SQL construct (e.g. divide_by_zero →
@@ -265,7 +242,7 @@ steps happens outside this query and is not your concern here):
 
 ━━━ HARD RULES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. Only SELECT. Never DROP, DELETE, TRUNCATE, ALTER, UPDATE, INSERT, CREATE, GRANT.
-2. Only reference columns that exist in {{prev}} schema (middle) or base tables (first/only).
+2. Only reference columns that exist in the current schema (previous step's columns for 'middle', base table columns for first/only).
 3. String literals (values, in WHERE/comparisons) use single quotes.
    Column ALIASES that contain spaces or special characters MUST use
    bracket-delimited identifiers — e.g. AS [Market Cap to Sales Ratio] —
@@ -279,6 +256,7 @@ steps happens outside this query and is not your concern here):
 8. The "columns" field you return MUST exactly match plan.column_plan.select_columns,
    in the same order — this is the single source of truth for the output schema,
    and it is checked programmatically after you respond.
+9. Summary should be 10 words at maximum with 4-6 preferred.
 
 ━━━ OUTPUT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Return only a raw JSON object — no markdown, no fences:
@@ -313,7 +291,7 @@ Previous Query Info:
 
     sql_user_prompt += f"""
 User Prompt (original, for reference only — follow the PLAN above): {user_prompt}
-REMINDER: Use {{prev}} as the FROM source when pipeline_position is 'middle'. SELECT only the plan's select_columns unless plan indicates otherwise.
+REMINDER: Always use the real table name in FROM. SELECT only the plan's select_columns unless plan indicates otherwise.
 """
 
     characters = len(sql_user_prompt) + len(sys_prompt)
@@ -325,12 +303,6 @@ REMINDER: Use {{prev}} as the FROM source when pipeline_position is 'middle'. SE
 
     sql = sanitize_llm_sql(result["sql"])
 
-    # ── Structural correctness check ──
-    # The plan's column_plan.select_columns is the source of truth for what
-    # the output schema should be. If the model's self-reported "columns"
-    # don't match the plan, we don't try to rewrite the SQL — we just trust
-    # the plan's column list for pipeline schema tracking, since the plan
-    # was reasoned about explicitly.
     planned_cols = plan.get("column_plan", {}).get("select_columns") or result["columns"]
     reported_cols = result["columns"]
 

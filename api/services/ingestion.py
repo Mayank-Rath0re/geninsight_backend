@@ -1,11 +1,9 @@
-# services/ingestion.py
 """
 Everything that happens to a dataset at upload time, before it becomes a
 queryable table: loading the raw file, computing metadata/statistics,
 classifying column roles for the SQL planner, building the LLM-authored
-knowledge base, and the optional basic auto-cleaning transform.
-
-(Was split across helper.get_dataframe and most of transform_handler.py.)
+knowledge base (now including an AI-generated session title in the same
+call), and the optional basic auto-cleaning transform.
 """
 
 import json
@@ -134,7 +132,15 @@ def build_knowledge_base(
     metadata: str,
     table_name: str,
     roles: str,
-) -> str:
+) -> dict:
+    """
+    Single AI call that produces both the knowledge base AND a proposed
+    session title (session_title), so staging a session never needs a
+    second, dedicated "name this session" call.
+
+    Returns a dict with keys: "knowledge_base" (str, JSON-encoded — same
+    shape/contract as before) and "session_title" (str).
+    """
     describe_str = df.describe(include="all").to_string()
     sample_str = df.head(5).to_string(index=False)
     cols = list(df.columns)
@@ -169,17 +175,19 @@ Return exactly this JSON structure (fill in values, keep all keys):
   "numeric_columns": ["all numeric columns"],
   "categorical_columns": ["all categorical/string columns"],
   "data_quality_notes": "brief note on nulls, outliers, or data issues",
-  "potential_analyses": ["3-5 analysis ideas this data supports"]
+  "potential_analyses": ["3-5 analysis ideas this data supports"],
+  "session_title": "a short (3-6 word) human-friendly title for a new analysis session on this dataset, e.g. 'Q3 Sales Analysis' or 'Customer Churn Data'"
 }}"""
     chars = len(system) + len(user)
-    print(f"---AI Called for Build_Knowledge_Base: {chars} characters or {chars/4} tokens roughly")
+    print(f"---AI Called for Build_Knowledge_Base (+session_title): {chars} characters or {chars/4} tokens roughly")
 
     raw = llm_client.ask_llm(system, user)
 
     kb_dict = json_utils.extract_json_object(raw)
+    session_title = kb_dict.pop("session_title", None) or f"Analysis of {table_name}"
     kb_dict["column_roles"] = json.loads(roles)
 
-    return json.dumps(kb_dict)
+    return {"knowledge_base": json.dumps(kb_dict), "session_title": session_title}
 
 
 def basic_transform(df: pd.DataFrame) -> pd.DataFrame:
@@ -235,8 +243,7 @@ def basic_transform(df: pd.DataFrame) -> pd.DataFrame:
 
 def sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Shared column-name sanitization used at upload time, before any
-    other processing (extracted from app.py's inline block so /upload
-    and basic_transform can't drift apart on the sanitization regex)."""
+    other processing."""
     df = df.copy()
     df.columns = (
         df.columns

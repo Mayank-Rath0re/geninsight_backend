@@ -26,6 +26,8 @@ services:
       context: ./api
       dockerfile: Dockerfile
     container_name: fastapi_container
+    environment:
+      - TZ=Asia/Kolkata
     ports:
       - "8000:8000"
     # Inject the .env file variables into the container at runtime

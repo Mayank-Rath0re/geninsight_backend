@@ -102,6 +102,7 @@ Rules:
 5. Return ONLY valid JSON.
 6. The y_column name in chart and result_df.column name after applying sql aliases should not be different, as they can cause error. If alias is used in sql, rename the columns to y column name after result_df generation also. """
     raw = llm_client.ask_llm(system, user)
+    print(f"LLM Response for Dashboard Intent: {raw}")
     return json_utils.extract_json_array(raw)
 
 

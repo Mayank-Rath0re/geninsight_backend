@@ -2,10 +2,11 @@
 import json
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from core import db
+from core.security import get_current_user_id, require_same_user
 from services import dashboard as dashboard_service
 
 logger = logging.getLogger("my_global_app_logger")
@@ -19,15 +20,18 @@ class DashboardIntentBasicRequest(BaseModel):
 
 
 @router.post("/dashboard_intent_basic")
-def dashboard_intent_basic(payload: DashboardIntentBasicRequest):
+def dashboard_intent_basic(payload: DashboardIntentBasicRequest, authed_user_id: int = Depends(get_current_user_id)):
     userId = payload.userId
     table_id = payload.table_id
     prompt = payload.prompt
+    require_same_user(authed_user_id, userId)
     try:
-        q = "SELECT metadata, knowledgebase FROM table_info WHERE id = %s"
+        q = "SELECT metadata, knowledgebase, user_id FROM table_info WHERE id = %s"
         row = db.fetch(q, params=(table_id,))
         if not row:
             raise HTTPException(status_code=404, detail="Table not found.")
+        if row[0][2] != userId:
+            raise HTTPException(status_code=401, detail="User Mismatch")
         metadata = json.loads(row[0][0])
         knowledge_base = json.loads(row[0][1])
 
@@ -62,15 +66,23 @@ def dashboard_intent_basic(payload: DashboardIntentBasicRequest):
 
 
 class CrossQuestioningRequest(BaseModel):
+    userId: int
     dashboard_id: int
     update_prompt: str
 
 
 @router.post("/cross_questioning")
-def cross_questioning(payload: CrossQuestioningRequest):
+def cross_questioning(payload: CrossQuestioningRequest, authed_user_id: int = Depends(get_current_user_id)):
     dashboard_id = payload.dashboard_id
     update_prompt = payload.update_prompt
+    require_same_user(authed_user_id, payload.userId)
     try:
+        owner = db.get_single_value("SELECT user_id FROM dashboards WHERE dashboard_id = %s", (dashboard_id,))
+        if owner is None:
+            raise HTTPException(status_code=404, detail="Dashboard not found.")
+        if owner != payload.userId:
+            raise HTTPException(status_code=401, detail="User Mismatch")
+
         user_feedback = dashboard_service.collect_feedback(update_prompt)
         db.run(
             "UPDATE dashboards SET user_response = %s WHERE dashboard_id = %s",
@@ -108,3 +120,90 @@ def cross_questioning(payload: CrossQuestioningRequest):
     except Exception as e:
         logger.exception("Cross questioning failed for dashboard %s", dashboard_id)
         raise HTTPException(status_code=500, detail=f"Cross questioning failed: {str(e)}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# LIST / READ / DELETE / STATUS (no LLM calls — no AI auth note needed
+# beyond the standard ownership check)
+# ─────────────────────────────────────────────────────────────────────────
+
+@router.get("/user_dashboards")
+def get_user_dashboards(userId: int, authed_user_id: int = Depends(get_current_user_id)):
+    require_same_user(authed_user_id, userId)
+    rows = db.fetch(
+        "SELECT dashboard_id, table_id, status, created_at FROM dashboards "
+        "WHERE user_id = %s AND is_deleted = 0 ORDER BY created_at DESC",
+        params=(userId,),
+    )
+    return {
+        "dashboards": [
+            {"dashboard_id": r[0], "table_id": r[1], "status": r[2], "created_at": r[3].isoformat() if r[3] else None}
+            for r in rows
+        ]
+    }
+
+
+@router.get("/dashboard")
+def get_dashboard(dashboard_id: int, userId: int, authed_user_id: int = Depends(get_current_user_id)):
+    require_same_user(authed_user_id, userId)
+    row = db.fetch(
+        "SELECT dashboard_id, table_id, dashboard_intent, user_response, status, breath_time, created_at "
+        "FROM dashboards WHERE dashboard_id = %s AND is_deleted = 0",
+        params=(dashboard_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Dashboard not found.")
+    r = row[0]
+    owner = db.get_single_value("SELECT user_id FROM dashboards WHERE dashboard_id = %s", (dashboard_id,))
+    if owner != userId:
+        raise HTTPException(status_code=401, detail="User Mismatch")
+    return {
+        "dashboard_id": r[0],
+        "table_id": r[1],
+        "dashboard_intent": json.loads(r[2]) if r[2] else None,
+        "user_response": r[3],
+        "status": r[4],
+        "breath_time": r[5],
+        "created_at": r[6].isoformat() if r[6] else None,
+    }
+
+
+class SetDashboardStatusRequest(BaseModel):
+    userId: int
+    dashboard_id: int
+    status: str  # 'Live' | 'Inactive'
+
+
+@router.post("/set_dashboard_status")
+def set_dashboard_status(payload: SetDashboardStatusRequest, authed_user_id: int = Depends(get_current_user_id)):
+    require_same_user(authed_user_id, payload.userId)
+    if payload.status not in ("Live", "Inactive"):
+        raise HTTPException(status_code=400, detail="status must be 'Live' or 'Inactive'.")
+
+    owner = db.get_single_value("SELECT user_id FROM dashboards WHERE dashboard_id = %s", (payload.dashboard_id,))
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Dashboard not found.")
+    if owner != payload.userId:
+        raise HTTPException(status_code=401, detail="User Mismatch")
+
+    db.run(
+        "UPDATE dashboards SET status = %s WHERE dashboard_id = %s",
+        (payload.status, payload.dashboard_id),
+    )
+    return {"dashboard_id": payload.dashboard_id, "status": payload.status}
+
+
+@router.post("/delete_dashboard")
+def delete_dashboard(dashboard_id: int, userId: int, authed_user_id: int = Depends(get_current_user_id)):
+    require_same_user(authed_user_id, userId)
+    owner = db.get_single_value("SELECT user_id FROM dashboards WHERE dashboard_id = %s", (dashboard_id,))
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Dashboard not found.")
+    if owner != userId:
+        raise HTTPException(status_code=401, detail="User Mismatch")
+
+    db.run(
+        "UPDATE dashboards SET is_deleted = 1, deleted_at = SYSDATETIME() WHERE dashboard_id = %s",
+        (dashboard_id,),
+    )
+    return {"dashboard_id": dashboard_id, "deleted": True}

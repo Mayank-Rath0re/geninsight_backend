@@ -92,13 +92,18 @@ class LoginRequest(BaseModel):
 
 @router.post("/login")
 def login(payload: LoginRequest, response: Response):
-    query = "SELECT id, password_hash, is_verified FROM auth WHERE email = %s"
+    query = "SELECT id, password_hash, is_verified, name FROM auth WHERE email = %s"
     result = db.fetch(query, (payload.email,))
 
     if not result:
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-    user_id, password_hash, is_verified = result[0][0], result[0][1], result[0][2]
+    user_id, password_hash, is_verified, name = (
+        result[0][0],
+        result[0][1],
+        result[0][2],
+        result[0][3],
+    )
 
     if not is_verified:
         raise HTTPException(status_code=403, detail="Please verify your email before logging in.")
@@ -106,7 +111,11 @@ def login(payload: LoginRequest, response: Response):
     if not verify_password(payload.password, password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-    token_data = {"sub": payload.email, "user_id": user_id}
+    # sub stays the stable identity claim (email) - used by /refresh to
+    # re-derive identity from the refresh token. name is a separate,
+    # display-only claim so client code can show it without another DB call.
+    # Falls back to email if name is somehow NULL (e.g. legacy rows).
+    token_data = {"sub": payload.email, "user_id": user_id, "name": name or payload.email}
     access_token = create_access_token(token_data)
     refresh_token = create_refresh_token(token_data, remember_me=payload.remember_me)
 
@@ -159,6 +168,7 @@ def refresh(request: Request, response: Response):
 
     user_id = payload.get("user_id")
     email = payload.get("sub")
+    name = payload.get("name")
 
     query = "SELECT refresh_token, refresh_token_expires_at FROM auth WHERE id = %s"
     result = db.fetch(query, (user_id,))
@@ -177,7 +187,7 @@ def refresh(request: Request, response: Response):
     if datetime.now(timezone.utc) > expires_at:
         raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
 
-    new_access_token = create_access_token({"sub": email, "user_id": user_id})
+    new_access_token = create_access_token({"sub": email, "user_id": user_id, "name": name})
 
     return {"access_token": new_access_token, "token_type": "bearer"}
 

@@ -1,32 +1,21 @@
-# services/merge_generation.py
 """
 Two-stage natural-language-to-SQL generation for MERGE (join) steps —
-sibling to services/query_generation.py, same plan-then-generate pattern,
-same LLM trust model (no human confirmation step, consistent with how
-/transform already executes LLM-generated SQL directly).
+sibling to services/query_generation.py, same plan-then-generate pattern.
 
-A merge step combines two upstream sources within a single session's CTE
-chain:
-  {prev}   — the target session's own pipeline output so far
-  {merge}  — the source session's pipeline output (its own CTE chain,
-             spliced in by services/pipeline.py), frozen at merge time
+REVERTED: this was briefly collapsed into a single AI call, but that
+caused reliability regressions, so it's back to plan-then-generate.
 
-Both stages here are read-only/SELECT-only, same as the transform flow.
-Only SELECT is ever produced — enforced the same way (hard rule in the
-generation prompt + the same non-SELECT guard in pipeline.py's CTE
-assembly applies to merge steps too).
+{prev} — the target session's own pipeline output so far
+{merge} — the source session's pipeline output, spliced in by
+          services/pipeline.py
 """
 
 import json
 
 from core import json_utils
 from services import llm_client
-from services.query_generation import sanitize_llm_sql  # same format-only cleanup, reused as-is
+from services.query_generation import sanitize_llm_sql
 
-
-# ─────────────────────────────────────────────────────────────────────────
-#  Stage 1: planning — decide join keys, join type, fan-out risk
-# ─────────────────────────────────────────────────────────────────────────
 
 def merge_plan_instructions(
     target_schema_cols: list,
@@ -40,8 +29,7 @@ def merge_plan_instructions(
     the target session ({prev}) and the CURRENT output schema of the
     source session ({merge}) — plus each side's knowledge base for
     semantic context — decides join key(s), join type, and flags fan-out
-    risk, exactly the way query_generation's planning stage flags risk
-    for ordinary transforms.
+    risk.
     """
 
     sys_prompt = """You are a join-planning assistant for a SQL Server pipeline. You do NOT write SQL.
@@ -103,10 +91,6 @@ Return exactly this JSON structure:
     return plan
 
 
-# ─────────────────────────────────────────────────────────────────────────
-#  Stage 2: SQL generation from the merge plan
-# ─────────────────────────────────────────────────────────────────────────
-
 def get_merge_sql(
     target_schema_cols: list,
     target_context: dict,
@@ -116,10 +100,8 @@ def get_merge_sql(
 ) -> dict:
     """
     Runs the plan stage, then mechanically generates a single SELECT that
-    joins {prev} and {merge}. Returns the same shape as
-    query_generation.get_sql_query: {"sql", "summary", "columns"}, plus
-    merge-specific plan metadata the caller needs for query_merges
-    (join_type, join_summary).
+    joins {prev} and {merge}. Returns {"sql", "summary", "columns"}, plus
+    merge-specific plan metadata (join_type, join_summary).
     """
 
     plan = merge_plan_instructions(

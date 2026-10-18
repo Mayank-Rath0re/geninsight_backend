@@ -20,12 +20,27 @@ from services import pipeline, query_generation
 logger = logging.getLogger("my_global_app_logger")
 router = APIRouter(tags=["transform"])
 
+from core.ai_trace import new_trace_id, log_ai_event
+from core.sql_safety import classify_sql_error
+
+MAX_SQL_ATTEMPTS = 2  # original + one AI repair
+USER_MESSAGES = {
+    "SQL_SYNTAX": "I couldn't build a valid query for that request. Try rephrasing it.",
+    "SQL_ORDER_BY": "I couldn't apply that sorting. Try rephrasing or asking for a top-N.",
+    "SQL_INVALID_COLUMN": "That request refers to a column I couldn't find. Check the column names.",
+    "SQL_GROUP_BY": "I couldn't build that grouping. Try rephrasing it.",
+    "SQL_CONVERSION": "A column's type didn't match what the request needed.",
+    "SQL_DIVIDE_BY_ZERO": "That calculation hit a division by zero.",
+    "SQL_TIMEOUT": "The query took too long. Try a narrower request.",
+    "UNKNOWN": "Something went wrong while running that step.",
+}
 
 @router.post("/transform")
 def transform_table(payload: models.TransformPayload, authed_user_id: int = Depends(get_current_user_id)):
     tables = payload.tables
     sessionId = payload.sessionId
     userId = payload.userId
+    trace_id = new_trace_id()
 
     require_same_user(authed_user_id, userId)
 
@@ -79,6 +94,10 @@ def transform_table(payload: models.TransformPayload, authed_user_id: int = Depe
             # Two AI calls (plan, then generate) — reverted from the
             # single-call experiment, which caused reliability issues.
             query_result = query_generation.get_sql_query(payload.prompt, tables_info, previous_query_data)
+            trace = query_result.get("trace", {})
+            log_ai_event(trace_id, "transform.generated", prompt=payload.prompt,
+                         sql=query_result["sql"], plan=trace.get("plan"),
+                         raw_response=trace.get("raw_response"))
 
             sql_query = query_result["sql"]
             query_summary = query_result["summary"]
@@ -101,16 +120,54 @@ def transform_table(payload: models.TransformPayload, authed_user_id: int = Depe
                 "SELECT id, prompt, sql_query, summary, updated_columns, step_type FROM queries WHERE id = %s",
                 (queryObjId,),
             )
-            q = cur.fetchone()
 
-        try:
-            output = pipeline.run_pipeline_result(sessionId, queryObjId)
-        except Exception:
+        output, last = None, None
+        for attempt in range(MAX_SQL_ATTEMPTS):
+            try:
+                output = pipeline.run_pipeline_result(sessionId, queryObjId)
+                break
+            except Exception as exc:
+                info = classify_sql_error(exc)
+                last = (exc, info)
+                log_ai_event(trace_id, "transform.execute_failed", level="error",
+                             attempt=attempt, error_code=info["code"], error=str(exc),
+                             prompt=payload.prompt, sql=sql_query,
+                             plan=trace.get("plan"), raw_response=trace.get("raw_response"))
+                if not info["retryable"] or attempt == MAX_SQL_ATTEMPTS - 1:
+                    break
+                try:
+                    fixed = query_generation.repair_sql(
+                        payload.prompt, sql_query, str(exc),
+                        json.loads(updated_columns), tables_info, previous_query_data)
+                    log_ai_event(trace_id, "transform.repaired", sql=fixed["sql"],
+                                 raw_response=fixed["raw_response"])
+                    sql_query, query_summary = fixed["sql"], fixed["summary"]
+                    db.run("UPDATE queries SET sql_query = %s, summary = %s WHERE id = %s",
+                           (sql_query, query_summary, queryObjId))
+                except Exception:
+                    logger.exception("Repair failed (trace %s)", trace_id)
+                    break
+
+        if output is None:
             try:
                 db.run("DELETE FROM queries WHERE id = %s", (queryObjId,))
             except Exception:
-                logger.exception("Cleanup failed for query %s after pipeline error", queryObjId)
-            raise
+                logger.exception("Cleanup failed for query %s", queryObjId)
+            exc, info = last
+            raise HTTPException(
+                status_code=422 if info["code"] != "UNKNOWN" else 500,
+                detail={
+                    "code": info["code"],
+                    "message": USER_MESSAGES.get(info["code"], USER_MESSAGES["UNKNOWN"]),
+                    "retryable": info["retryable"],
+                    "trace_id": trace_id,
+                },
+            )
+
+        r = db.fetch(
+            "SELECT id, prompt, sql_query, summary, updated_columns, step_type FROM queries WHERE id = %s",
+            params=(queryObjId,))
+        q = r[0]
 
         return {
             "sessionId": sessionId,

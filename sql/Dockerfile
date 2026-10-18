@@ -9,7 +9,7 @@ USER root
 # Copy init scripts and entrypoint
 COPY init-scripts/init.sql /init-scripts/init.sql
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 USER mssql
 

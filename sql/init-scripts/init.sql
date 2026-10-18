@@ -153,19 +153,28 @@ BEGIN
         dashboard_id     INT IDENTITY(1,1) PRIMARY KEY,
         user_id          INT NULL,
         table_id         INT NOT NULL,
+        prompt           NVARCHAR(MAX) NULL,
         dashboard_intent NVARCHAR(MAX) NULL,
         user_response    NVARCHAR(MAX) NULL,
         status           VARCHAR(10) NOT NULL DEFAULT 'Inactive'
             CONSTRAINT chk_dashboard_status CHECK (status IN ('Live', 'Inactive')),
         breath_time      INT         NOT NULL DEFAULT 5,
+        is_shared        BIT NOT NULL DEFAULT 0,
+        share_token      VARCHAR(64) NULL,
+        shared_snapshot  NVARCHAR(MAX) NULL,
+        shared_at        DATETIME2 NULL,
         is_deleted       BIT NOT NULL DEFAULT 0,
         deleted_at       DATETIME2 NULL,
         created_at       DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+        updated_at       DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
         CONSTRAINT fk_dashboards_user FOREIGN KEY (user_id)
             REFERENCES auth(id) ON DELETE CASCADE,
         CONSTRAINT fk_dashboards_table FOREIGN KEY (table_id)
             REFERENCES table_info(id) ON DELETE NO ACTION
     );
+    CREATE INDEX ix_dashboards_user_table ON dashboards(user_id, table_id);
+    CREATE UNIQUE INDEX uq_dashboards_share_token ON dashboards(share_token)
+        WHERE share_token IS NOT NULL;
 END
 GO
 

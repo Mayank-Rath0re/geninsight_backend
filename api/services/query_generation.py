@@ -17,20 +17,22 @@ import re
 from core import json_utils
 from services import llm_client
 
+from core.sql_safety import sanitize_sql as sanitize_llm_sql
 
-def sanitize_llm_sql(sql: str) -> str:
-    """
-    Light, format-only cleanup of LLM-returned SQL. Deliberately does NOT
-    attempt to judge or rewrite query *logic* — correctness is instead
-    checked in get_sql_query by comparing the plan's intended column list
-    against the LLM's own reported columns.
-    """
-    sql = re.sub(r"```(?:sql)?\s*", "", sql)
-    sql = re.sub(r"```", "", sql).strip()
-    sql = sql.rstrip(";").strip()
-    sql = re.sub(r"\bSELECT\s+,", "SELECT *,", sql, flags=re.IGNORECASE)
-    return sql
-
+ORDER_BY_RULES = """\
+ORDER BY RULES (CRITICAL — every query you write is later embedded as a CTE / derived table
+by the pipeline, where a bare ORDER BY is a hard SQL Server error, Msg 1033):
+ 1. Add ORDER BY only if the plan's sort_logic is non-empty. Otherwise emit none.
+ 2. NEVER put ORDER BY inside a CTE, subquery, derived table or view body, unless that same
+    SELECT also has TOP or OFFSET. Sorting happens once, at the outermost SELECT only.
+ 3. Outermost ORDER BY: always finish with `OFFSET 0 ROWS`, e.g.
+      ... ORDER BY [Revenue] DESC OFFSET 0 ROWS
+    For "top N" use `ORDER BY ... OFFSET 0 ROWS FETCH NEXT N ROWS ONLY`.
+    Never combine TOP with OFFSET in the same SELECT.
+ 4. ORDER BY may only reference columns or aliases of the final SELECT. With GROUP BY, only
+    grouped columns or aggregates. With DISTINCT, only columns that are in the select list.
+ 5. ORDER BY inside window functions, e.g. ROW_NUMBER() OVER (ORDER BY x), is fine.
+"""
 
 def query_generation_instructions(
     user_prompt: str,
@@ -112,6 +114,11 @@ CRITICAL — never produce a GROUP BY with no aggregation:
   query later becomes part of, and it is not an instruction about CTEs — CTE chaining
   across pipeline steps is handled separately, outside this step's query, so do not
   suggest avoiding or restructuring CTEs here.
+- Sorting: set sort_logic ONLY if the user explicitly asks for ordering, ranking or top/bottom N.
+  Express top-N inside sort_logic (e.g. "top 10 by revenue DESC"). The generated SQL is always
+  embedded as a CTE by later pipeline steps, so never plan an ORDER BY for an intermediate
+  sub-select; if you must pre-sort inside a sub-select, it needs a TOP/OFFSET and a reason.
+  Add an "order_by_in_cte" entry to risk_checks whenever sort_logic is non-empty.
 
 Respond with ONLY a single raw JSON object — no markdown fences, no preamble, no trailing text.
 The response must be directly parseable by json.loads().
@@ -240,6 +247,8 @@ part of, and it is not about CTE structure (CTE chaining across pipeline
 steps happens outside this query and is not your concern here):
 {plan.get("optimization") or "none"}
 
+{ORDER_BY_RULES}
+
 ━━━ HARD RULES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. Only SELECT. Never DROP, DELETE, TRUNCATE, ALTER, UPDATE, INSERT, CREATE, GRANT.
 2. Only reference columns that exist in the current schema (previous step's columns for 'middle', base table columns for first/only).
@@ -320,4 +329,38 @@ REMINDER: Always use the real table name in FROM. SELECT only the plan's select_
         "sql": sql,
         "summary": result["summary"],
         "columns": columns_out,
+        "trace": {"plan": plan, "raw_response": raw},
+    }
+
+def repair_sql(user_prompt: str, bad_sql: str, error_message: str,
+               expected_columns: list, tables_info: list,
+               previous_query_data: dict = None) -> dict:
+    sys_prompt = f"""You fix SQL Server SELECT queries that failed at execution.
+      Return ONLY raw JSON: {{"sql": "...", "summary": "<=10 words"}}.
+      Keep the output columns exactly: {json.dumps(expected_columns)}.
+      Only SELECT. No trailing semicolon. Use [brackets] for aliases with spaces. Reference only columns that exist.
+
+      {ORDER_BY_RULES}"""
+    user = f"""USER REQUEST: {user_prompt}
+
+      FAILED SQL:
+      {bad_sql}
+
+      SQL SERVER ERROR:
+      {error_message}
+
+      TABLES:
+      """ + "\n".join(
+        f"Table {t['name']}\n metadata: {t['metadata']}\n knowledge_base: {t['knowledgebase']}"
+        for t in tables_info
+    )
+    if previous_query_data:
+        user += f"\nColumns before this step: {previous_query_data['updated_columns']}"
+    raw = llm_client.ask_llm(sys_prompt, user)
+    result = json_utils.extract_json_object(raw)
+    return {
+        "sql": sanitize_llm_sql(result["sql"]),
+        "summary": result.get("summary", "Repaired query"),
+        "columns": expected_columns,
+        "raw_response": raw,
     }

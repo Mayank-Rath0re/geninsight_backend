@@ -66,12 +66,14 @@ BEGIN
         createdAt      DATETIME NULL,
         is_deleted     BIT NOT NULL DEFAULT 0,
         deleted_at     DATETIME2 NULL,
+        purged_at      DATETIME2 NULL,   -- set by services/retention.py once the physical table is dropped
         CONSTRAINT fk_tableinfo_user FOREIGN KEY (user_id)
             REFERENCES auth(id) ON DELETE CASCADE,
         CONSTRAINT fk_tableinfo_datasource FOREIGN KEY (data_source_id)
             REFERENCES data_sources(id) ON DELETE NO ACTION
     );
     CREATE INDEX ix_table_info_datasource ON table_info(data_source_id);
+    CREATE INDEX ix_table_info_user_created ON table_info(user_id, is_deleted, createdAt);
 END
 GO
 
@@ -223,53 +225,92 @@ BEGIN
 END
 GO
 
+-- ═══════════════════════════ Billing, usage & organizations ═══════════════════════════
+
+
 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='plans' AND xtype='U')
 BEGIN
     CREATE TABLE plans (
-        id                     INT IDENTITY(1,1) PRIMARY KEY,
-        name                   VARCHAR(100) NOT NULL,
-        description            NVARCHAR(500) NULL,
-        price                  DECIMAL(10,2) NOT NULL,
-        currency               VARCHAR(10) NOT NULL DEFAULT 'INR',
-        billing_interval       VARCHAR(20) NOT NULL
-            CONSTRAINT chk_plan_interval CHECK (billing_interval IN ('monthly', 'yearly', 'one_time')),
-        max_tables             INT NULL,
-        max_queries_per_month  INT NULL,
-        max_data_sources       INT NULL,
-        razorpay_plan_id       VARCHAR(100) NULL,
-        is_active              BIT NOT NULL DEFAULT 1,
-        created_at             DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+        id                    INT IDENTITY(1,1) PRIMARY KEY,
+        code                  VARCHAR(30)   NOT NULL,           -- free | individual | maxx | enterprise
+        name                  VARCHAR(100)  NOT NULL,
+        price                 DECIMAL(10,2) NOT NULL,           -- DISPLAY price only; Razorpay plan holds the real amount
+        currency              VARCHAR(10)   NOT NULL DEFAULT 'USD',
+        per_seat              BIT           NOT NULL DEFAULT 0,
+        min_seats             INT           NOT NULL DEFAULT 1,
+        max_files             INT           NOT NULL,
+        daily_token_limit     BIGINT        NULL,               -- NULL = unlimited
+        session_token_limit   BIGINT        NULL,               -- NULL = unlimited
+        monthly_query_limit   INT           NULL,               -- Free tier only
+        retention_days        INT           NULL,               -- NULL = forever
+        max_data_sources      INT           NULL,               -- 0 = none, NULL = unlimited
+        features              NVARCHAR(MAX) NULL,               -- JSON feature flags
+        is_active             BIT           NOT NULL DEFAULT 1,
+        created_at            DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
     );
+    CREATE UNIQUE INDEX uq_plans_code ON plans(code);
+END
+GO
+
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='organizations' AND xtype='U')
+BEGIN
+    CREATE TABLE organizations (
+        id            INT IDENTITY(1,1) PRIMARY KEY,
+        name          NVARCHAR(150) NOT NULL,
+        owner_user_id INT NOT NULL,
+        created_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT fk_org_owner FOREIGN KEY (owner_user_id) REFERENCES auth(id) ON DELETE NO ACTION
+    );
+    CREATE INDEX ix_org_owner ON organizations(owner_user_id);
+END
+GO
+
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='org_members' AND xtype='U')
+BEGIN
+    CREATE TABLE org_members (
+        org_id        INT NOT NULL,
+        user_id       INT NOT NULL,
+        role          VARCHAR(10) NOT NULL DEFAULT 'member'
+            CONSTRAINT chk_orgm_role CHECK (role IN ('owner', 'member')),
+        status        VARCHAR(10) NOT NULL DEFAULT 'active'
+            CONSTRAINT chk_orgm_status CHECK (status IN ('invited', 'active', 'removed')),
+        invited_email VARCHAR(255) NULL,
+        created_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT pk_org_members PRIMARY KEY (org_id, user_id),
+        CONSTRAINT fk_orgm_org  FOREIGN KEY (org_id)  REFERENCES organizations(id) ON DELETE CASCADE,
+        CONSTRAINT fk_orgm_user FOREIGN KEY (user_id) REFERENCES auth(id) ON DELETE CASCADE
+    );
+    CREATE INDEX ix_orgm_user ON org_members(user_id, status);
 END
 GO
 
 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='subscriptions' AND xtype='U')
 BEGIN
     CREATE TABLE subscriptions (
-        id                        INT IDENTITY(1,1) PRIMARY KEY,
-        user_id                   INT NOT NULL,
-        plan_id                   INT NOT NULL,
-        status                    VARCHAR(20) NOT NULL DEFAULT 'created'
+        id                       INT IDENTITY(1,1) PRIMARY KEY,
+        owner_user_id            INT NOT NULL,                  -- the payer
+        org_id                   INT NULL,                      -- set for Enterprise (members share the plan)
+        plan_id                  INT NOT NULL,
+        seats                    INT NOT NULL DEFAULT 1,
+        status                   VARCHAR(20) NOT NULL DEFAULT 'created'
             CONSTRAINT chk_sub_status CHECK (status IN
-                ('created', 'active', 'trialing', 'past_due', 'cancelled', 'expired', 'halted')),
-        razorpay_subscription_id  VARCHAR(100) NULL,
-        razorpay_customer_id      VARCHAR(100) NULL,
-        current_period_start      DATETIME2 NULL,
-        current_period_end        DATETIME2 NULL,
-        cancel_at_period_end      BIT NOT NULL DEFAULT 0,
-        cancelled_at              DATETIME2 NULL,
-        created_at                DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
-        is_deleted                BIT NOT NULL DEFAULT 0,
-        deleted_at                DATETIME2 NULL,
-        CONSTRAINT fk_subscriptions_user FOREIGN KEY (user_id)
-            REFERENCES auth(id) ON DELETE CASCADE,
-        CONSTRAINT fk_subscriptions_plan FOREIGN KEY (plan_id)
-            REFERENCES plans(id) ON DELETE NO ACTION
+                ('created','authenticated','active','pending','halted',
+                 'cancelled','completed','expired','paused')),
+        razorpay_subscription_id VARCHAR(100) NOT NULL,
+        razorpay_customer_id     VARCHAR(100) NULL,
+        current_period_start     DATETIME2 NULL,
+        current_period_end       DATETIME2 NULL,
+        cancel_at_period_end     BIT NOT NULL DEFAULT 0,
+        cancelled_at             DATETIME2 NULL,
+        created_at               DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        updated_at               DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT fk_sub_owner FOREIGN KEY (owner_user_id) REFERENCES auth(id) ON DELETE NO ACTION,
+        CONSTRAINT fk_sub_org   FOREIGN KEY (org_id)  REFERENCES organizations(id) ON DELETE NO ACTION,
+        CONSTRAINT fk_sub_plan  FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE NO ACTION
     );
-    CREATE INDEX ix_subscriptions_user ON subscriptions(user_id);
-    CREATE INDEX ix_subscriptions_status ON subscriptions(status);
-    CREATE UNIQUE INDEX uq_subscriptions_razorpay_id ON subscriptions(razorpay_subscription_id)
-        WHERE razorpay_subscription_id IS NOT NULL;
+    CREATE INDEX ix_sub_owner  ON subscriptions(owner_user_id, status);
+    CREATE INDEX ix_sub_org    ON subscriptions(org_id, status);
+    CREATE UNIQUE INDEX uq_sub_razorpay ON subscriptions(razorpay_subscription_id);
 END
 GO
 
@@ -279,31 +320,88 @@ BEGIN
         id                   INT IDENTITY(1,1) PRIMARY KEY,
         user_id              INT NOT NULL,
         subscription_id      INT NULL,
+        razorpay_payment_id  VARCHAR(100) NOT NULL,
         razorpay_order_id    VARCHAR(100) NULL,
-        razorpay_payment_id  VARCHAR(100) NULL,
-        razorpay_signature   VARCHAR(255) NULL,
-        amount               DECIMAL(10,2) NOT NULL,
-        currency             VARCHAR(10) NOT NULL DEFAULT 'INR',
-        status               VARCHAR(20) NOT NULL DEFAULT 'created'
-            CONSTRAINT chk_payment_status CHECK (status IN
-                ('created', 'authorized', 'captured', 'failed', 'refunded')),
+        amount               DECIMAL(12,2) NOT NULL,
+        currency             VARCHAR(10) NOT NULL,
+        status               VARCHAR(20) NOT NULL
+            CONSTRAINT chk_payment_status CHECK (status IN ('authorized','captured','failed','refunded')),
         method               VARCHAR(30) NULL,
-        created_at           DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
-        CONSTRAINT fk_payments_user FOREIGN KEY (user_id)
-            REFERENCES auth(id) ON DELETE CASCADE,
-        CONSTRAINT fk_payments_subscription FOREIGN KEY (subscription_id)
-            REFERENCES subscriptions(id) ON DELETE NO ACTION
+        created_at           DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT fk_pay_user FOREIGN KEY (user_id) REFERENCES auth(id) ON DELETE NO ACTION,
+        CONSTRAINT fk_pay_sub  FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE NO ACTION
     );
-    CREATE INDEX ix_payments_user ON payments(user_id);
-    CREATE INDEX ix_payments_subscription ON payments(subscription_id);
-    CREATE UNIQUE INDEX uq_payments_razorpay_payment_id ON payments(razorpay_payment_id)
-        WHERE razorpay_payment_id IS NOT NULL;
+    CREATE UNIQUE INDEX uq_pay_rzp ON payments(razorpay_payment_id);
+    CREATE INDEX ix_pay_user ON payments(user_id);
 END
 GO
 
-IF NOT EXISTS (SELECT 1 FROM plans WHERE name = 'Free')
+-- Idempotency log for Razorpay webhooks (Razorpay retries deliveries).
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='webhook_events' AND xtype='U')
 BEGIN
-    INSERT INTO plans (name, description, price, currency, billing_interval, max_tables, max_queries_per_month, max_data_sources)
-    VALUES ('Free', 'Default free tier for new signups', 0.00, 'INR', 'monthly', 3, 50, 1);
+    CREATE TABLE webhook_events (
+        id          INT IDENTITY(1,1) PRIMARY KEY,
+        event_id    VARCHAR(100) NOT NULL,
+        event_type  VARCHAR(60)  NOT NULL,
+        payload     NVARCHAR(MAX) NULL,
+        received_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+    );
+    CREATE UNIQUE INDEX uq_webhook_event_id ON webhook_events(event_id);
 END
+GO
+
+-- One row per user: the three live limit windows.
+--   session: 5h window, opened by the first metered call after the previous one expired
+--   day:     24h window, same rule
+--   month:   calendar month (query count, used by Free)
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='usage_counters' AND xtype='U')
+BEGIN
+    CREATE TABLE usage_counters (
+        user_id            INT NOT NULL PRIMARY KEY,
+        session_started_at DATETIME2 NULL,
+        session_tokens     BIGINT NOT NULL DEFAULT 0,
+        day_started_at     DATETIME2 NULL,
+        day_tokens         BIGINT NOT NULL DEFAULT 0,
+        month_start        DATE NULL,
+        month_queries      INT NOT NULL DEFAULT 0,
+        updated_at         DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT fk_uc_user FOREIGN KEY (user_id) REFERENCES auth(id) ON DELETE CASCADE
+    );
+END
+GO
+
+-- Append-only ledger: audit trail and future analytics/billing disputes.
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='usage_events' AND xtype='U')
+BEGIN
+    CREATE TABLE usage_events (
+        id            BIGINT IDENTITY(1,1) PRIMARY KEY,
+        user_id       INT NOT NULL,
+        kind          VARCHAR(30) NOT NULL,         -- transform | merge | dashboard | chart | knowledgebase ...
+        input_tokens  BIGINT NOT NULL DEFAULT 0,
+        output_tokens BIGINT NOT NULL DEFAULT 0,
+        total_tokens  BIGINT NOT NULL DEFAULT 0,
+        llm_calls     INT NOT NULL DEFAULT 0,
+        counted_query BIT NOT NULL DEFAULT 0,
+        trace_id      VARCHAR(64) NULL,
+        created_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT fk_ue_user FOREIGN KEY (user_id) REFERENCES auth(id) ON DELETE CASCADE
+    );
+    CREATE INDEX ix_ue_user_time ON usage_events(user_id, created_at);
+END
+GO
+
+-- Seed catalog. ASSUMPTIONS: Maxx session cap 750k; Individual "additional features" TBD.
+IF NOT EXISTS (SELECT 1 FROM plans WHERE code='free')
+    INSERT INTO plans (code,name,price,currency,per_seat,min_seats,max_files,daily_token_limit,session_token_limit,monthly_query_limit,retention_days,max_data_sources,features)
+    VALUES ('free','Free',0,'USD',0,1,5,NULL,NULL,50,90,0,'{}');
+IF NOT EXISTS (SELECT 1 FROM plans WHERE code='individual')
+    INSERT INTO plans (code,name,price,currency,per_seat,min_seats,max_files,daily_token_limit,session_token_limit,monthly_query_limit,retention_days,max_data_sources,features)
+    VALUES ('individual','Individual',25.00,'USD',1,1,30,1000000,250000,NULL,365,0,'{}');
+IF NOT EXISTS (SELECT 1 FROM plans WHERE code='maxx')
+    INSERT INTO plans (code,name,price,currency,per_seat,min_seats,max_files,daily_token_limit,session_token_limit,monthly_query_limit,retention_days,max_data_sources,features)
+    VALUES ('maxx','Maxx',49.99,'USD',1,1,60,3000000,750000,NULL,NULL,0,'{"analysis":true,"storytelling":true}');
+IF NOT EXISTS (SELECT 1 FROM plans WHERE code='enterprise')
+    INSERT INTO plans (code,name,price,currency,per_seat,min_seats,max_files,daily_token_limit,session_token_limit,monthly_query_limit,retention_days,max_data_sources,features)
+    VALUES ('enterprise','Enterprise',40.00,'USD',1,5,75,NULL,NULL,NULL,NULL,NULL,
+            '{"analysis":true,"storytelling":true,"self_db":true,"custom_llm":true,"business_context":true,"priority_support":true}');
 GO

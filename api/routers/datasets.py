@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
 from core import db
 from core.security import get_current_user_id, require_same_user
+from services import usage_service
 from services.table_ingest import ingest_table_and_session
 
 logger = logging.getLogger("my_global_app_logger")
@@ -17,7 +18,9 @@ router = APIRouter(tags=["datasets"])
 def get_user_datasets(userId: int, authed_user_id: int = Depends(get_current_user_id)) -> list:
     require_same_user(authed_user_id, userId)
     try:
-        query = "SELECT id, name, createdAt FROM table_info WHERE user_id = %s"
+        # is_deleted filter: retention/soft-deleted datasets must not reappear in the picker.
+        query = ("SELECT id, name, createdAt FROM table_info "
+                 "WHERE user_id = %s AND is_deleted = 0")
         output = db.fetch(query, params=(userId,))
         if not output:
             return []
@@ -40,18 +43,23 @@ async def upload_dataset(
     """
     Ingests the file, creates its table_info row, AND creates a
     brand-new session for it with a mechanical initial "SELECT *" step —
-    all in one call. This replaces the old flow where /upload only
-    created the table and a session was minted lazily later (either on
-    first /transform, or via the frontend's silent merge-bootstrap
-    transform). Uses 1 AI call total (knowledge base + session_title).
+    all in one call. Uses 1 AI call total (knowledge base + session_title).
+
+    Billing: enforces the plan's file cap, blocks when a token window is exhausted (the
+    knowledge-base call spends tokens), and meters that call. Uploads are not "queries", so the
+    Free monthly query cap does not block them.
     """
     require_same_user(authed_user_id, userId)
     try:
-        result = await ingest_table_and_session(
-            user_id=userId,
-            file=file,
-            apply_basic_transformation=apply_basic_transformation,
-        )
+        usage_service.assert_can_upload(userId)
+        usage_service.check_quota(userId, include_queries=False)
+
+        with usage_service.metered_call(userId, "upload") as meter:
+            result = await ingest_table_and_session(
+                user_id=userId,
+                file=file,
+                apply_basic_transformation=apply_basic_transformation,
+            )
         return {
             "table_id": result["table_id"],
             "session_id": result["session_id"],
@@ -76,15 +84,13 @@ def create_session_for_table(userId: int, tableId: int, authed_user_id: int = De
     Starts a brand-new session for an already-ingested table (the
     "select an existing dataset" path in Step 0). No AI call — the
     table's knowledge base was already generated when it was first
-    uploaded, so this only needs a mechanical initial "SELECT *" step,
-    exactly like a fresh upload's session creation but skipping
-    ingestion entirely.
+    uploaded, so this only needs a mechanical initial "SELECT *" step.
     """
     require_same_user(authed_user_id, userId)
-    owner = db.get_single_value("SELECT user_id FROM table_info WHERE id = %s", (tableId,))
-    if owner is None:
+    row = db.fetch("SELECT user_id, is_deleted FROM table_info WHERE id = %s", (tableId,))
+    if not row or row[0][1]:
         raise HTTPException(status_code=404, detail=f"Table {tableId} not found")
-    if owner != userId:
+    if row[0][0] != userId:
         raise HTTPException(status_code=401, detail="User Mismatch")
 
     table_name = _resolve_table_name(tableId)
@@ -168,10 +174,10 @@ def _fetch_table_preview(table_id: int, limit: int = 200, offset: int = 0) -> di
 
 
 def _check_table_owner(table_id: int, authed_user_id: int) -> None:
-    owner = db.get_single_value("SELECT user_id FROM table_info WHERE id = %s", (table_id,))
-    if owner is None:
+    row = db.fetch("SELECT user_id, is_deleted FROM table_info WHERE id = %s", (table_id,))
+    if not row or row[0][1]:
         raise HTTPException(status_code=404, detail=f"Table {table_id} not found")
-    if owner != authed_user_id:
+    if row[0][0] != authed_user_id:
         raise HTTPException(status_code=401, detail="User Mismatch")
 
 

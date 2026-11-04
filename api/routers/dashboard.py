@@ -9,12 +9,21 @@ from core import db
 from core.ai_trace import log_ai_event, new_trace_id
 from core.security import get_current_user_id, require_same_user
 from services import dashboard as dashboard_service
+from services import usage_service
 
 logger = logging.getLogger("my_global_app_logger")
 router = APIRouter(tags=["dashboard"])
 
+# Billing notes
+#  - Viewing/reusing a saved dashboard never calls the AI, so it is never blocked by usage limits.
+#  - Generating or editing a widget calls the AI: gated by check_quota and metered.
+#  - A generation/edit counts toward the Free monthly query cap only if it actually used the AI
+#    and succeeded (meter.llm_calls > 0).
+
+
 def _iso(value):
     return value.isoformat() if value else None
+
 
 def _load_table_context(table_id: int):
     rows = db.fetch(
@@ -25,12 +34,14 @@ def _load_table_context(table_id: int):
         raise HTTPException(status_code=404, detail="Table not found.")
     return rows[0][0], rows[0][1], rows[0][2]
 
+
 def _check_dashboard_owner(dashboard_id: int, user_id: int) -> None:
     owner = db.get_single_value("SELECT user_id FROM dashboards WHERE dashboard_id = %s", (dashboard_id,))
     if owner is None:
         raise HTTPException(status_code=404, detail="Dashboard not found.")
     if owner != user_id:
         raise HTTPException(status_code=401, detail="User Mismatch")
+
 
 def _failed_item_ids(spec: dict) -> list:
     return [
@@ -40,8 +51,10 @@ def _failed_item_ids(spec: dict) -> list:
         if i.get("status") != "ok"
     ]
 
+
 def _any_ok(spec: dict) -> bool:
     return any(i.get("status") == "ok" for k in ("kpis", "charts") for i in spec.get(k, []))
+
 
 def _share_state(dashboard_id: int) -> dict:
     rows = db.fetch(
@@ -62,6 +75,7 @@ def _share_state(dashboard_id: int) -> dict:
         "updated_at": _iso(updated_at),
     }
 
+
 def _payload(dashboard_id: int, spec: dict, data: dict, trace_id: str, reused: bool = False, summary=None) -> dict:
     out = {
         "dashboard_id": dashboard_id,
@@ -75,20 +89,33 @@ def _payload(dashboard_id: int, spec: dict, data: dict, trace_id: str, reused: b
         out["dashboard_intent"] = summary
     return out
 
+
+# ─────────────────────────────────────────────────────────────────────────
+# GENERATE
+# ─────────────────────────────────────────────────────────────────────────
+
 class DashboardIntentBasicRequest(BaseModel):
     userId: int
     table_id: int
     prompt: str
     force_regenerate: bool = False
 
+
 @router.post("/dashboard_intent_basic")
 def dashboard_intent_basic(payload: DashboardIntentBasicRequest, authed_user_id: int = Depends(get_current_user_id)):
+    require_same_user(authed_user_id, payload.userId)
+    trace_id = new_trace_id()
+    with usage_service.metered_call(payload.userId, "dashboard", trace_id) as meter:
+        result = _dashboard_intent_basic_impl(payload, trace_id)
+        meter.count_query = meter.llm_calls > 0
+    return result
+
+
+def _dashboard_intent_basic_impl(payload: DashboardIntentBasicRequest, trace_id: str) -> dict:
     userId = payload.userId
     table_id = payload.table_id
     prompt = payload.prompt
-    require_same_user(authed_user_id, userId)
 
-    trace_id = new_trace_id()
     try:
         owner = db.get_single_value("SELECT user_id FROM table_info WHERE id = %s", (table_id,))
         if owner is None:
@@ -131,6 +158,9 @@ def dashboard_intent_basic(payload: DashboardIntentBasicRequest, authed_user_id:
                                     summary=dashboard_service.render_dashboard_summary(saved))
                 log_ai_event(trace_id, "dashboard.reuse_unusable", level="warn", dashboard_id=existing_id)
 
+        # From here on the AI is used: enforce the quota first.
+        usage_service.check_quota(userId)
+
         spec = dashboard_service.extract_dashboard_intent(
             table_id, prompt, knowledge_base, metadata, table_name
         )
@@ -171,16 +201,30 @@ def dashboard_intent_basic(payload: DashboardIntentBasicRequest, authed_user_id:
             },
         )
 
+
+# ─────────────────────────────────────────────────────────────────────────
+# EDIT ONE WIDGET
+# ─────────────────────────────────────────────────────────────────────────
+
 class UpdateDashboardItemRequest(BaseModel):
     userId: int
     dashboard_id: int
     item_id: str
     prompt: str
 
+
 @router.post("/update_dashboard_item")
 def update_dashboard_item(payload: UpdateDashboardItemRequest, authed_user_id: int = Depends(get_current_user_id)):
     require_same_user(authed_user_id, payload.userId)
+    usage_service.check_quota(payload.userId)  # always calls the AI
     trace_id = new_trace_id()
+    with usage_service.metered_call(payload.userId, "dashboard_edit", trace_id) as meter:
+        result = _update_dashboard_item_impl(payload, trace_id)
+        meter.count_query = meter.llm_calls > 0
+    return result
+
+
+def _update_dashboard_item_impl(payload: UpdateDashboardItemRequest, trace_id: str) -> dict:
     try:
         _check_dashboard_owner(payload.dashboard_id, payload.userId)
         row = db.fetch(
@@ -246,6 +290,11 @@ def update_dashboard_item(payload: UpdateDashboardItemRequest, authed_user_id: i
             },
         )
 
+
+# ─────────────────────────────────────────────────────────────────────────
+# READ / LIST
+# ─────────────────────────────────────────────────────────────────────────
+
 @router.get("/user_dashboards")
 def get_user_dashboards(userId: int, authed_user_id: int = Depends(get_current_user_id)):
     require_same_user(authed_user_id, userId)
@@ -275,6 +324,7 @@ def get_user_dashboards(userId: int, authed_user_id: int = Depends(get_current_u
         })
     return {"dashboards": out}
 
+
 @router.get("/dashboard")
 def get_dashboard(dashboard_id: int, userId: int, authed_user_id: int = Depends(get_current_user_id)):
     require_same_user(authed_user_id, userId)
@@ -299,11 +349,27 @@ def get_dashboard(dashboard_id: int, userId: int, authed_user_id: int = Depends(
         **_share_state(dashboard_id),
     }
 
+
 @router.get("/dashboard_data")
 def dashboard_data(dashboard_id: int, userId: int, repair: bool = True,
                    authed_user_id: int = Depends(get_current_user_id)):
     require_same_user(authed_user_id, userId)
+
+    # `repair` may call the AI to fix broken widgets. When the user is out of quota, skip the repair
+    # instead of failing: they can still view their dashboard, it just won't self-heal right now.
+    allow_repair = repair
+    if repair:
+        try:
+            usage_service.check_quota(userId)
+        except HTTPException:
+            allow_repair = False
+
     trace_id = new_trace_id()
+    with usage_service.metered_call(userId, "dashboard_data", trace_id):
+        return _dashboard_data_impl(dashboard_id, userId, allow_repair, trace_id)
+
+
+def _dashboard_data_impl(dashboard_id: int, userId: int, allow_repair: bool, trace_id: str) -> dict:
     try:
         row = db.fetch(
             "SELECT dashboard_intent, table_id, user_id FROM dashboards "
@@ -318,7 +384,7 @@ def dashboard_data(dashboard_id: int, userId: int, repair: bool = True,
         intent = json.loads(row[0][0])
         table_name, metadata_raw, kb_raw = _load_table_context(row[0][1])
         spec, data = dashboard_service.build_dashboard(
-            intent, table_name, json.loads(metadata_raw), json.loads(kb_raw), trace_id, allow_ai=repair
+            intent, table_name, json.loads(metadata_raw), json.loads(kb_raw), trace_id, allow_ai=allow_repair
         )
 
         db.run(
@@ -342,11 +408,17 @@ def dashboard_data(dashboard_id: int, userId: int, repair: bool = True,
             },
         )
 
+
+# ─────────────────────────────────────────────────────────────────────────
+# SHARE / STATUS / DELETE (no AI)
+# ─────────────────────────────────────────────────────────────────────────
+
 class ShareDashboardRequest(BaseModel):
     userId: int
     dashboard_id: int
     enabled: bool = True
     refresh: bool = False
+
 
 @router.post("/share_dashboard")
 def share_dashboard(payload: ShareDashboardRequest, authed_user_id: int = Depends(get_current_user_id)):
@@ -419,10 +491,12 @@ def share_dashboard(payload: ShareDashboardRequest, authed_user_id: int = Depend
             },
         )
 
+
 class SetDashboardStatusRequest(BaseModel):
     userId: int
     dashboard_id: int
     status: str
+
 
 @router.post("/set_dashboard_status")
 def set_dashboard_status(payload: SetDashboardStatusRequest, authed_user_id: int = Depends(get_current_user_id)):
@@ -437,6 +511,7 @@ def set_dashboard_status(payload: SetDashboardStatusRequest, authed_user_id: int
         (payload.status, payload.dashboard_id),
     )
     return {"dashboard_id": payload.dashboard_id, "status": payload.status}
+
 
 @router.post("/delete_dashboard")
 def delete_dashboard(dashboard_id: int, userId: int, authed_user_id: int = Depends(get_current_user_id)):

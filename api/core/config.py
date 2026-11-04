@@ -75,3 +75,38 @@ SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")
 
 ENV = os.getenv("ENV", "development")  # set ENV=production in your prod .env
+
+# ---------------------------------------------------------------------------
+# CORS
+# ---------------------------------------------------------------------------
+# Comma-separated exact origins, e.g. "https://app.example.com,https://www.example.com".
+# Wildcard "*" cannot be combined with credentials (the refresh-token cookie), so in
+# development any localhost port is allowed via a regex instead (Flutter web picks random ports).
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+CORS_ORIGIN_REGEX = r"https?://(localhost|127\.0\.0\.1)(:\d+)?" if ENV != "production" else None
+
+# ---------------------------------------------------------------------------
+# Billing (Razorpay)
+# ---------------------------------------------------------------------------
+# KEY_ID is public (sent to the client at checkout). KEY_SECRET and WEBHOOK_SECRET never leave
+# the server. Plan ids come from Razorpay Dashboard > Subscriptions > Plans.
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
+RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
+RAZORPAY_PLAN_IDS = {
+    "individual": os.getenv("RAZORPAY_PLAN_INDIVIDUAL", ""),
+    "maxx": os.getenv("RAZORPAY_PLAN_MAXX", ""),
+    "enterprise": os.getenv("RAZORPAY_PLAN_ENTERPRISE", ""),
+}
+
+if ENV == "production" and not (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET and RAZORPAY_WEBHOOK_SECRET):
+    logger.warning("Razorpay is not fully configured; paid checkout and webhooks will fail.")
+
+# ---------------------------------------------------------------------------
+# Background jobs
+# ---------------------------------------------------------------------------
+# Run the retention/purge scheduler in exactly ONE process. With several workers, set
+# RUN_SCHEDULER=0 on all but one.
+RUN_SCHEDULER = os.getenv("RUN_SCHEDULER", "1") == "1"
+PURGE_GRACE_DAYS = int(os.getenv("PURGE_GRACE_DAYS", "30"))      # hidden -> physically dropped
+DOWNGRADE_GRACE_DAYS = int(os.getenv("DOWNGRADE_GRACE_DAYS", "30"))  # no retention deletes right after a plan lapses

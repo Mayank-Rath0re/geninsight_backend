@@ -2,12 +2,12 @@
 """
 LLM client (was llm_handler.py).
 
-NOTE: The original file also defined `generate_response()` (a single-prompt,
-no-system-message variant) and its `_generate_response_groq` /
-`_generate_response_openrouter` backends. Nothing in the codebase called
-`generate_response` — every call site uses `ask_llm(system, user)` — so
-that unused path has been removed here. If a single-prompt variant is
-needed later, it can be re-added as `ask_llm(system_prompt="", ...)`.
+Token metering: every SUCCESSFUL provider call reports its input/output tokens through
+core.usage_context.record_llm_usage(). Failed or rate-limited attempts that fall through to
+the next model/provider are not charged. If a provider omits `usage`, tokens are estimated at
+~4 characters per token so usage is never silently free.
+
+NOTE: The original file also defined `generate_response()`; nothing called it, so it stays removed.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from core.config import (
     GROQ_MODELS,
     DEFAULT_LLM_PROVIDER,
 )
+from core.usage_context import record_llm_usage
 
 logger = logging.getLogger("llm_client")
 
@@ -74,20 +75,38 @@ def _resolve_provider(activate: Optional[Provider]) -> Provider:
     return provider
 
 
+# --- Usage metering ---
+
+def _meter(completion, messages: list[dict[str, str]], content: str) -> None:
+    """Report tokens for one successful completion (never raises)."""
+    try:
+        usage = getattr(completion, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        if prompt_tokens is None or completion_tokens is None:
+            prompt_tokens = sum(len(m.get("content", "")) for m in messages) // 4
+            completion_tokens = len(content) // 4
+        record_llm_usage(prompt_tokens, completion_tokens)
+    except Exception:
+        logger.exception("Failed to record LLM usage")
+
+
 # --- OpenRouter backend ---
 
 def _ask_llm_openrouter(system_prompt: str, user_prompt: str) -> str:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
     try:
         completion = _get_openrouter_client().chat.completions.create(
             model=OPENROUTER_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=messages,
         )
         content = completion.choices[0].message.content
         if not content:
             raise ValueError("OpenRouter returned an empty response.")
+        _meter(completion, messages, content)
         return content
     except (OpenRouterAPIStatusError, OpenRouterAPIConnectionError) as e:
         logger.error(f"OpenRouter API Error: {e}")
@@ -128,6 +147,7 @@ def _execute_groq_completion(messages: list[dict[str, str]]) -> str:
             content = completion.choices[0].message.content
             if not content:
                 raise ValueError(f"Groq model {model} returned an empty response.")
+            _meter(completion, messages, content)
             return content
 
         except APIStatusError as e:

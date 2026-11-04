@@ -12,3 +12,5 @@ openai
 passlib[bcrypt]
 bcrypt==4.0.1
 pyjwt
+razorpay>=1.4.2
+apscheduler>=3.10

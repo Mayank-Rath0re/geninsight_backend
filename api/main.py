@@ -1,26 +1,56 @@
 # main.py
 """
-App entrypoint. Only responsible for: creating the FastAPI app, middleware,
-health checks, and mounting routers. All endpoint logic lives in routers/,
-all business logic lives in services/, all DB/config/JSON plumbing lives
-in core/.
+App entrypoint. Only responsible for: creating the FastAPI app, middleware, scheduler,
+health checks, and mounting routers. All endpoint logic lives in routers/, all business logic
+lives in services/, all DB/config/JSON plumbing lives in core/.
 """
 
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import auth, charts, dashboard, datasets, merge, public, sessions, transform, query
+from core import config, context_propagation
+from routers import (
+    auth, billing, charts, dashboard, datasets, merge, organizations, public, query, sessions, transform,
+)
+from services import retention
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("my_global_app_logger")
 
-app = FastAPI()
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # Make ThreadPoolExecutor workers inherit the request context so LLM token usage is metered.
+    context_propagation.install()
+
+    scheduler = None
+    if config.RUN_SCHEDULER:
+        from apscheduler.schedulers.background import BackgroundScheduler
+
+        scheduler = BackgroundScheduler(timezone="UTC")
+        scheduler.add_job(retention.run_retention_sweep, "cron", hour=2, minute=30,
+                          id="retention_sweep", max_instances=1, coalesce=True)
+        scheduler.add_job(retention.run_purge_sweep, "cron", hour=3, minute=0,
+                          id="purge_sweep", max_instances=1, coalesce=True)
+        scheduler.start()
+        logger.info("Scheduler started (retention 02:30 UTC, purge 03:00 UTC)")
+    try:
+        yield
+    finally:
+        if scheduler:
+            scheduler.shutdown(wait=False)
+
+
+app = FastAPI(lifespan=lifespan)
+
+# allow_credentials=True (refresh-token cookie) is invalid with a "*" origin.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # your actual frontend origin — exact scheme+host+port
+    allow_origins=config.CORS_ORIGINS,
+    allow_origin_regex=config.CORS_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,6 +65,8 @@ app.include_router(dashboard.router)
 app.include_router(charts.router)
 app.include_router(query.router)
 app.include_router(public.router)
+app.include_router(billing.router)
+app.include_router(organizations.router)
 
 
 # ─────────────────────────────────────────────────────────────────────────

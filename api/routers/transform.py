@@ -5,6 +5,10 @@ Session creation no longer happens here — every session is now created
 synchronously at upload time (routers/datasets.py's /upload), seeded
 with an initial mechanical "SELECT *" step. sessionId is therefore
 always required and must already exist; this router only appends to it.
+
+Billing: the public handler gates on the user's quota BEFORE any LLM spend and meters every
+LLM call (plan, generate, repair) made while the step runs. A step counts toward the Free
+monthly query cap only if it succeeds; tokens are recorded either way.
 """
 
 import json
@@ -15,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException
 import models
 from core import db
 from core.security import get_current_user_id, require_same_user
-from services import pipeline, query_generation
+from services import pipeline, query_generation, usage_service
 
 logger = logging.getLogger("my_global_app_logger")
 router = APIRouter(tags=["transform"])
@@ -35,22 +39,32 @@ USER_MESSAGES = {
     "UNKNOWN": "Something went wrong while running that step.",
 }
 
+
 @router.post("/transform")
 def transform_table(payload: models.TransformPayload, authed_user_id: int = Depends(get_current_user_id)):
-    tables = payload.tables
-    sessionId = payload.sessionId
-    userId = payload.userId
-    trace_id = new_trace_id()
+    require_same_user(authed_user_id, payload.userId)
 
-    require_same_user(authed_user_id, userId)
-
-    if not tables:
+    if not payload.tables:
         raise HTTPException(status_code=400, detail="At least one table id is required.")
-    if sessionId is None:
+    if payload.sessionId is None:
         raise HTTPException(
             status_code=400,
             detail="sessionId is required — sessions are created at upload time.",
         )
+
+    usage_service.check_quota(payload.userId)  # 429 USAGE_LIMIT before any LLM spend
+
+    trace_id = new_trace_id()
+    with usage_service.metered_call(payload.userId, "transform", trace_id) as meter:
+        result = _transform_impl(payload, trace_id)
+        meter.count_query = True  # reached only on success
+    return result
+
+
+def _transform_impl(payload: models.TransformPayload, trace_id: str) -> dict:
+    tables = payload.tables
+    sessionId = payload.sessionId
+    userId = payload.userId
 
     try:
         with db.transaction() as cur:

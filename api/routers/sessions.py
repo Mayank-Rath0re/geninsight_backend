@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 from core import db
 from core.security import get_current_user_id, require_same_user
-from services import pipeline
+from services import dataset_cleanup, pipeline
 
 logger = logging.getLogger("my_global_app_logger")
 router = APIRouter(tags=["sessions"])
@@ -18,7 +18,7 @@ router = APIRouter(tags=["sessions"])
 def session_info(sessionId: int, userId: int, authed_user_id: int = Depends(get_current_user_id)):
     require_same_user(authed_user_id, userId)
     try:
-        query1 = "SELECT TOP 1 session_id, user_id, table_id FROM sessions WHERE session_id = %s"
+        query1 = "SELECT TOP 1 session_id, user_id, table_id FROM sessions WHERE session_id = %s AND is_deleted = 0"
         output = db.fetch(query1, params=(sessionId,))
         if not output:
             raise HTTPException(
@@ -136,10 +136,16 @@ def delete_session(session_id: int, user_id: int, authed_user_id: int = Depends(
     query2 = "UPDATE sessions SET is_deleted=1, deleted_at = SYSDATETIME() WHERE session_id = %s AND user_id = %s"
     db.run(query=query2, params=(session_id, user_id))
     if table_id:
-        db.run(
-            query="UPDATE table_info SET is_deleted=1, deleted_at = SYSDATETIME() WHERE id = %s",
-            params=(table_id,)
+        remaining = db.get_single_value(
+            "SELECT COUNT(*) FROM sessions WHERE table_id = %s AND is_deleted = 0",
+            (table_id,),
         )
+        if int(remaining or 0) == 0:
+            table_name = db.get_single_value("SELECT name FROM table_info WHERE id = %s", (table_id,))
+            with db.transaction() as cur:
+                dataset_cleanup.soft_delete_dataset(cur, table_id)
+            if table_name:
+                dataset_cleanup.drop_physical_table_if_unused(table_id, table_name)
 
 
 @router.get("/pipeline_result")
@@ -152,7 +158,7 @@ def pipeline_result(sessionId: int, userId: int, queryId: int, authed_user_id: i
     require_same_user(authed_user_id, userId)
     try:
         row = db.fetch(
-            "SELECT TOP 1 user_id FROM sessions WHERE session_id = %s",
+            "SELECT TOP 1 user_id FROM sessions WHERE session_id = %s AND is_deleted = 0",
             params=(sessionId,),
         )
         if not row:

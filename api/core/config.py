@@ -49,7 +49,7 @@ GROQ_MODELS = [
     "openai/gpt-oss-120b",   # Secondary (high TPM headroom)
 ]
 
-DEFAULT_LLM_PROVIDER = "groq"  # "groq" | "openrouter"
+DEFAULT_LLM_PROVIDER = "openrouter"  # "groq" | "openrouter"
 
 # ---------------------------------------------------------------------------
 # Auth (JWT)

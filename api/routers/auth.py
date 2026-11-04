@@ -92,7 +92,7 @@ class LoginRequest(BaseModel):
 
 @router.post("/login")
 def login(payload: LoginRequest, response: Response):
-    query = "SELECT id, password_hash, is_verified, name FROM auth WHERE email = %s"
+    query = "SELECT id, password_hash, is_verified, name FROM auth WHERE email = %s AND is_deleted = 0"
     result = db.fetch(query, (payload.email,))
 
     if not result:
@@ -170,13 +170,13 @@ def refresh(request: Request, response: Response):
     email = payload.get("sub")
     name = payload.get("name")
 
-    query = "SELECT refresh_token, refresh_token_expires_at FROM auth WHERE id = %s"
+    query = "SELECT refresh_token, refresh_token_expires_at, name FROM auth WHERE id = %s AND is_deleted = 0"
     result = db.fetch(query, (user_id,))
 
     if not result:
         raise HTTPException(status_code=401, detail="User not found.")
 
-    stored_token, expires_at = result[0][0], result[0][1]
+    stored_token, expires_at, current_name = result[0][0], result[0][1], result[0][2]
 
     if stored_token != refresh_token:
         # Token doesn't match what's on file -> was revoked, or a new login happened elsewhere
@@ -187,7 +187,11 @@ def refresh(request: Request, response: Response):
     if datetime.now(timezone.utc) > expires_at:
         raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
 
-    new_access_token = create_access_token({"sub": email, "user_id": user_id, "name": name})
+    # The display name can change after login (Settings), so take the current
+    # value from the database instead of the one frozen in the refresh token.
+    new_access_token = create_access_token(
+        {"sub": email, "user_id": user_id, "name": current_name or name}
+    )
 
     return {"access_token": new_access_token, "token_type": "bearer"}
 

@@ -27,7 +27,12 @@ def get_dataframe(filepath: str) -> pd.DataFrame | None:
 
 
 def extract_metadata(filepath: str) -> str:
-    dataframe = get_dataframe(filepath)
+    return metadata_from_dataframe(get_dataframe(filepath))
+
+
+def metadata_from_dataframe(dataframe: pd.DataFrame) -> str:
+    """Per-column statistics used by the SQL planner and dashboard generator.
+    Shared by file uploads and custom-database table registration."""
     meta: Dict[str, Any] = {}
     for col in dataframe.columns:
         unique_count = int(dataframe[col].nunique())
@@ -46,7 +51,7 @@ def extract_metadata(filepath: str) -> str:
         else:
             meta[col]["sample_values"] = [str(v) for v in non_null_values[:5].tolist()]
 
-        if pd.api.types.is_numeric_dtype(dataframe[col]):
+        if pd.api.types.is_numeric_dtype(dataframe[col]) and unique_count:
             meta[col]["min"] = str(round(float(dataframe[col].min()), 4))
             meta[col]["max"] = str(round(float(dataframe[col].max()), 4))
             meta[col]["mean"] = str(round(float(dataframe[col].mean()), 4))

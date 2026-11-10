@@ -140,6 +140,14 @@ def _transform_impl(payload: models.TransformPayload, trace_id: str) -> dict:
             try:
                 output = pipeline.run_pipeline_result(sessionId, queryObjId)
                 break
+            except HTTPException:
+                # Revoked/missing custom DB: not an SQL problem, so don't repair —
+                # just discard this step and surface the original error.
+                try:
+                    db.run("DELETE FROM queries WHERE id = %s", (queryObjId,))
+                except Exception:
+                    logger.exception("Cleanup failed for query %s", queryObjId)
+                raise
             except Exception as exc:
                 info = classify_sql_error(exc)
                 last = (exc, info)

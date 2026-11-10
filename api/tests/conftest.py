@@ -67,7 +67,7 @@ def _install_stubs():
         sessionId: int | None = None
 
     _stub("models", TransformPayload=TransformPayload)
-    for name in ("auth", "sessions", "merge", "public", "charts", "query"):
+    for name in ("auth", "sessions", "merge", "public", "charts", "query", "data_sources"):
         _stub(f"routers.{name}", router=APIRouter())
 
 

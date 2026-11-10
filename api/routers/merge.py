@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from core.security import get_current_user_id, require_same_user
 from services import merge
+from services.custom_db import execution
 from services.table_ingest import ingest_table_and_session
 
 logger = logging.getLogger("my_global_app_logger")
@@ -45,6 +46,16 @@ async def merge_upload(
        (1 AI call — see services/merge_generation.py).
     """
     require_same_user(authed_user_id, userId)
+    # Uploaded files live in our database, so they can't be joined into a
+    # session that reads from a client-owned database. Fail before ingesting.
+    if execution.session_data_source_id(targetSessionId) is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This session is backed by a custom database, so a file cannot be merged "
+                "into it. Connect the new data as its own database instead."
+            ),
+        )
     try:
         ingest_result = await ingest_table_and_session(
             user_id=userId,

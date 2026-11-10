@@ -1,9 +1,10 @@
 import json
 
-from core import db, json_utils
+from core import json_utils
 from core.ai_trace import log_ai_event
 from core.sql_safety import classify_sql_error, is_safe_select, sanitize_sql
 from services import llm_client
+from services.custom_db import execution
 from services.query_generation import ORDER_BY_RULES
 
 MAX_DASH_ROWS = 1000
@@ -173,12 +174,12 @@ def _repair_dashboard_sql(item_id, kind, item, bad_sql, error, table_name, meta,
     log_ai_event(trace_id, "dashboard.sql_repaired", item_id=item_id, raw_response=raw)
     return json_utils.extract_json_object(raw)["sql"]
 
-def _run_item(kind: str, item: dict, sql: str) -> dict:
+def _run_item(kind: str, item: dict, sql: str, table_id: int) -> dict:
     ok, why = is_safe_select(sql)
     if not ok:
         raise PermissionError(f"Unsafe SQL rejected: {why}")
 
-    res = db.fetch_with_columns(sql)
+    res = execution.run_for_table(table_id, sql, limit=MAX_DASH_ROWS)
     cols, rows = list(res["columns"]), res["rows"][:MAX_DASH_ROWS]
 
     expected = _expected_columns(kind, item)
@@ -191,7 +192,7 @@ def _run_item(kind: str, item: dict, sql: str) -> dict:
     cols = [rename.get(c, c) for c in cols]
     return {"columns": cols, "rows": [list(r) for r in rows]}
 
-def build_dashboard(intent: dict, table_name: str, metadata, knowledge_base, trace_id: str, only_ids=None, allow_ai: bool = True):
+def build_dashboard(intent: dict, table_id: int, table_name: str, metadata, knowledge_base, trace_id: str, only_ids=None, allow_ai: bool = True):
     meta = json.loads(metadata) if isinstance(metadata, str) else metadata
 
     for kind, key in (("kpi", "kpis"), ("chart", "charts")):
@@ -223,7 +224,7 @@ def build_dashboard(intent: dict, table_name: str, metadata, knowledge_base, tra
 
             for attempt in range(2):
                 try:
-                    data[iid] = _run_item(kind, item, sql)
+                    data[iid] = _run_item(kind, item, sql, table_id)
                     item["sql_query"], item["status"], item["error"] = sql, "ok", None
                     break
                 except Exception as exc:

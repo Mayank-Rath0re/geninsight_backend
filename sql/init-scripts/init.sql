@@ -27,6 +27,17 @@ BEGIN
 END
 GO
 
+-- Custom (client-owned) database connections.
+-- API field -> column mapping (the public payload keeps the shorter names):
+--   userId      -> user_id            (owner)
+--   dbname      -> database_name
+--   dburl       -> host
+--   dbport      -> port
+--   dbuser      -> username
+--   dbpassword  -> secret_encrypted   (Fernet ciphertext, never stored in plain text)
+--   dbtype      -> engine             (mysql | mssql | postgres)
+-- Tables of a custom DB are registered in table_info with data_source_id set; no
+-- physical table is ever created in genbi_db for them.
 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='data_sources' AND xtype='U')
 BEGIN
     CREATE TABLE data_sources (
@@ -40,12 +51,16 @@ BEGIN
         database_name     VARCHAR(255) NULL,
         username          VARCHAR(255) NULL,
         secret_encrypted  NVARCHAR(MAX) NOT NULL,
+        ssl_enabled       BIT NOT NULL
+            CONSTRAINT df_ds_ssl DEFAULT 0,
         status            VARCHAR(20) NOT NULL DEFAULT 'active'
             CONSTRAINT chk_ds_status CHECK (status IN ('active', 'unreachable', 'revoked')),
         last_connected_at DATETIME2 NULL,
+        last_error        NVARCHAR(4000) NULL,
         is_deleted        BIT NOT NULL DEFAULT 0,
         deleted_at        DATETIME2 NULL,
         created_at        DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+        updated_at        DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
         CONSTRAINT fk_ds_user FOREIGN KEY (user_id)
             REFERENCES auth(id) ON DELETE CASCADE
     );
@@ -53,14 +68,29 @@ BEGIN
 END
 GO
 
+-- Migrations for databases created before the columns above existed.
+IF COL_LENGTH('data_sources', 'ssl_enabled') IS NULL
+    ALTER TABLE data_sources ADD ssl_enabled BIT NOT NULL CONSTRAINT df_ds_ssl DEFAULT 0;
+GO
+IF COL_LENGTH('data_sources', 'last_error') IS NULL
+    ALTER TABLE data_sources ADD last_error NVARCHAR(4000) NULL;
+GO
+IF COL_LENGTH('data_sources', 'updated_at') IS NULL
+    ALTER TABLE data_sources ADD updated_at DATETIME2 NOT NULL CONSTRAINT df_ds_updated_at DEFAULT SYSDATETIME();
+GO
+IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'ix_data_sources_user_active')
+    CREATE INDEX ix_data_sources_user_active ON data_sources(user_id, is_deleted);
+GO
+
 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='table_info' AND xtype='U')
 BEGIN
     CREATE TABLE table_info (
         id             INT IDENTITY(1,1) PRIMARY KEY,
-        name           VARCHAR(100) NOT NULL,
+        name           VARCHAR(255) NOT NULL,
         user_id        INT NULL,
         data_source_id INT NULL,
         source_table   VARCHAR(255) NULL,
+        source_schema  VARCHAR(128) NULL,  -- default schema of a custom DB table (NULL for internal tables)
         knowledgebase  NVARCHAR(MAX) NULL,
         metadata       NVARCHAR(MAX) NULL,
         createdAt      DATETIME NULL,
@@ -75,6 +105,18 @@ BEGIN
     CREATE INDEX ix_table_info_datasource ON table_info(data_source_id);
     CREATE INDEX ix_table_info_user_created ON table_info(user_id, is_deleted, createdAt);
 END
+GO
+
+IF COL_LENGTH('table_info', 'source_table') IS NULL
+    ALTER TABLE table_info ADD source_table VARCHAR(255) NULL;
+GO
+IF COL_LENGTH('table_info', 'source_schema') IS NULL
+    ALTER TABLE table_info ADD source_schema VARCHAR(128) NULL;
+GO
+-- Custom-DB table names can be up to 128 chars (SQL Server) / 64 (MySQL, Postgres).
+IF EXISTS (SELECT 1 FROM sys.columns
+           WHERE object_id = OBJECT_ID('table_info') AND name = 'name' AND max_length < 255)
+    ALTER TABLE table_info ALTER COLUMN name VARCHAR(255) NOT NULL;
 GO
 
 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='sessions' AND xtype='U')
@@ -302,6 +344,7 @@ BEGIN
         current_period_end       DATETIME2 NULL,
         cancel_at_period_end     BIT NOT NULL DEFAULT 0,
         cancelled_at             DATETIME2 NULL,
+        is_test_grant            BIT NOT NULL DEFAULT 0,        -- 1 = free Maxx granted during testing phase
         created_at               DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
         updated_at               DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
         CONSTRAINT fk_sub_owner FOREIGN KEY (owner_user_id) REFERENCES auth(id) ON DELETE NO ACTION,
@@ -312,6 +355,11 @@ BEGIN
     CREATE INDEX ix_sub_org    ON subscriptions(org_id, status);
     CREATE UNIQUE INDEX uq_sub_razorpay ON subscriptions(razorpay_subscription_id);
 END
+GO
+
+-- For databases created before is_test_grant existed (the CREATE TABLE above is skipped there).
+IF COL_LENGTH('subscriptions', 'is_test_grant') IS NULL
+    ALTER TABLE subscriptions ADD is_test_grant BIT NOT NULL DEFAULT 0;
 GO
 
 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='payments' AND xtype='U')
@@ -391,17 +439,85 @@ END
 GO
 
 -- Seed catalog. ASSUMPTIONS: Maxx session cap 750k; Individual "additional features" TBD.
+-- max_data_sources = how many client-owned DB connections a plan may add (NULL = unlimited):
+--   Free 2, Individual 10, Maxx 25, Enterprise unlimited.
 IF NOT EXISTS (SELECT 1 FROM plans WHERE code='free')
     INSERT INTO plans (code,name,price,currency,per_seat,min_seats,max_files,daily_token_limit,session_token_limit,monthly_query_limit,retention_days,max_data_sources,features)
-    VALUES ('free','Free',0,'USD',0,1,5,NULL,NULL,50,90,0,'{}');
+    VALUES ('free','Free',0,'USD',0,1,5,NULL,NULL,50,90,2,'{}');
 IF NOT EXISTS (SELECT 1 FROM plans WHERE code='individual')
     INSERT INTO plans (code,name,price,currency,per_seat,min_seats,max_files,daily_token_limit,session_token_limit,monthly_query_limit,retention_days,max_data_sources,features)
-    VALUES ('individual','Individual',25.00,'USD',1,1,30,1000000,250000,NULL,365,0,'{}');
+    VALUES ('individual','Individual',25.00,'USD',1,1,30,1000000,250000,NULL,365,10,'{}');
 IF NOT EXISTS (SELECT 1 FROM plans WHERE code='maxx')
     INSERT INTO plans (code,name,price,currency,per_seat,min_seats,max_files,daily_token_limit,session_token_limit,monthly_query_limit,retention_days,max_data_sources,features)
-    VALUES ('maxx','Maxx',49.99,'USD',1,1,60,3000000,750000,NULL,NULL,0,'{"analysis":true,"storytelling":true}');
+    VALUES ('maxx','Maxx',49.99,'USD',1,1,60,3000000,750000,NULL,NULL,25,'{"analysis":true,"storytelling":true}');
 IF NOT EXISTS (SELECT 1 FROM plans WHERE code='enterprise')
     INSERT INTO plans (code,name,price,currency,per_seat,min_seats,max_files,daily_token_limit,session_token_limit,monthly_query_limit,retention_days,max_data_sources,features)
     VALUES ('enterprise','Enterprise',40.00,'USD',1,5,75,NULL,NULL,NULL,NULL,NULL,
             '{"analysis":true,"storytelling":true,"self_db":true,"custom_llm":true,"business_context":true,"priority_support":true}');
+GO
+
+-- Backfill the data-source limits on databases seeded before this column had tiers.
+UPDATE plans SET max_data_sources = 2    WHERE code = 'free';
+UPDATE plans SET max_data_sources = 10   WHERE code = 'individual';
+UPDATE plans SET max_data_sources = 25   WHERE code = 'maxx';
+UPDATE plans SET max_data_sources = NULL WHERE code = 'enterprise';
+GO
+
+-- ═══════════════════ TESTING PHASE: every new account gets Maxx ═══════════════════
+-- App is in testing only, so no pricing yet. Every new row in `auth` automatically
+-- receives a free Maxx subscription flagged is_test_grant = 1.
+--
+-- WHEN LAUNCHING PRICING (run manually):
+--   1. DROP TRIGGER trg_auth_assign_maxx_testing;
+--   2. UPDATE subscriptions
+--         SET status = 'expired', current_period_end = SYSUTCDATETIME(), updated_at = SYSUTCDATETIME()
+--       WHERE is_test_grant = 1 AND status = 'active';
+--   Users then fall back to Free. Make sure any Razorpay sync job skips is_test_grant = 1.
+
+IF OBJECT_ID('trg_auth_assign_maxx_testing', 'TR') IS NOT NULL
+    DROP TRIGGER trg_auth_assign_maxx_testing;
+GO
+
+CREATE TRIGGER trg_auth_assign_maxx_testing
+ON auth
+AFTER INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @maxx_plan_id INT = (SELECT id FROM plans WHERE code = 'maxx');
+    IF @maxx_plan_id IS NULL RETURN;
+
+    INSERT INTO subscriptions (
+        owner_user_id, org_id, plan_id, seats, status,
+        razorpay_subscription_id, razorpay_customer_id,
+        current_period_start, current_period_end,
+        cancel_at_period_end, is_test_grant
+    )
+    SELECT
+        i.id, NULL, @maxx_plan_id, 1, 'active',
+        CONCAT('TEST-', i.id), NULL,
+        SYSUTCDATETIME(), DATEADD(YEAR, 10, SYSUTCDATETIME()),  -- effectively non-expiring during testing
+        0, 1
+    FROM inserted i
+    WHERE NOT EXISTS (
+        SELECT 1 FROM subscriptions s WHERE s.owner_user_id = i.id
+    );
+END
+GO
+
+-- Backfill: give Maxx to existing users who have no subscription yet
+INSERT INTO subscriptions (
+    owner_user_id, org_id, plan_id, seats, status,
+    razorpay_subscription_id, current_period_start, current_period_end,
+    cancel_at_period_end, is_test_grant
+)
+SELECT
+    a.id, NULL, p.id, 1, 'active',
+    CONCAT('TEST-', a.id), SYSUTCDATETIME(), DATEADD(YEAR, 10, SYSUTCDATETIME()),
+    0, 1
+FROM auth a
+CROSS JOIN (SELECT id FROM plans WHERE code = 'maxx') p
+WHERE a.is_deleted = 0
+  AND NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.owner_user_id = a.id);
 GO

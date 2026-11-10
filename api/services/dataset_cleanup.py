@@ -40,6 +40,13 @@ def is_merge_source(table_id: int) -> bool:
 
 
 def drop_physical_table_if_unused(table_id: int, table_name: str) -> bool:
+    # Tables on a client-owned database were never physically ingested; there is
+    # nothing in our SQL Server to drop (and the remote table must stay).
+    source_id = db.get_single_value(
+        "SELECT data_source_id FROM table_info WHERE id = %s", (table_id,)
+    )
+    if source_id is not None:
+        return False
     if not table_name or UNSAFE_TABLE_NAME.search(table_name):
         logger.warning("Refusing to drop table with unsafe name for table_id %s", table_id)
         return False

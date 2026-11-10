@@ -35,6 +35,7 @@ from fastapi import HTTPException
 
 from core import db
 from services import merge_generation, pipeline
+from services.custom_db import execution
 
 logger = logging.getLogger("my_global_app_logger")
 
@@ -103,6 +104,20 @@ def perform_merge(target_session_id: int, source_session_id: int, user_id: int, 
         raise HTTPException(status_code=404, detail=f"Source session {source_session_id} not found")
     if source_owner != user_id:
         raise HTTPException(status_code=401, detail="User Mismatch")
+
+    # The pipeline splices both chains into ONE query executed on the target's
+    # database, so both sides must live in the same place (ours, or the same
+    # client DB). Joining an uploaded file with a custom DB is not possible.
+    target_source = execution.session_data_source_id(target_session_id)
+    source_source = execution.session_data_source_id(source_session_id)
+    if target_source != source_source:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Cannot merge sessions that come from different databases. "
+                "Merge is supported within the same database only."
+            ),
+        )
 
     # ── Resolve target side ({prev}) ──
     target_root_table = _get_session_root_table(target_session_id)

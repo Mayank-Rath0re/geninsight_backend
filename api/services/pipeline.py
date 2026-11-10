@@ -3,6 +3,7 @@ import re
 
 from core import db
 from core.sql_safety import mask_sql
+from services.custom_db import execution
 
 def _fetch_session_table_name(session_id: int) -> str:
     rows = db.fetch(
@@ -218,8 +219,9 @@ def assemble_cte_query(session_id: int, query_id: int) -> str:
 
 def run_pipeline_result(session_id: int, query_id: int, limit: int = 0, offset: int = 0):
     assembled_cte_query = assemble_cte_query(session_id=session_id, query_id=query_id)
-    return db.fetch_with_columns(
+    return execution.run_for_session(
+        session_id,
         assembled_cte_query,
-        limit=limit if limit > 0 else None,
-        offset=offset if offset > 0 else None,
+        limit=limit or None,
+        offset=offset,
     )

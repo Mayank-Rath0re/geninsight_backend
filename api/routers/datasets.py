@@ -5,9 +5,10 @@ import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
-from core import db
+from core import config, db
 from core.security import get_current_user_id, require_same_user
 from services import usage_service
+from services.custom_db import execution
 from services.table_ingest import ingest_table_and_session
 
 logger = logging.getLogger("my_global_app_logger")
@@ -94,8 +95,13 @@ def create_session_for_table(userId: int, tableId: int, authed_user_id: int = De
         raise HTTPException(status_code=401, detail="User Mismatch")
 
     table_name = _resolve_table_name(tableId)
+    table_ref = execution.quote_tsql(table_name)
 
     try:
+        # Columns come from the table's own database (ours or the client's).
+        columns = execution.fetch_columns_for_table(tableId, table_name)
+        select_sql = f"SELECT * FROM {table_ref}"
+
         with db.transaction() as cur:
             cur.execute(
                 "INSERT INTO sessions (user_id, session_title, table_id) "
@@ -104,10 +110,6 @@ def create_session_for_table(userId: int, tableId: int, authed_user_id: int = De
             )
             row = cur.fetchone()
             new_session_id = row[0]
-
-            select_sql = f"SELECT * FROM [{table_name}]"
-            cur.execute(f"SELECT TOP 0 * FROM [{table_name}]")
-            columns = [desc[0] for desc in cur.description]
 
             cur.execute(
                 "INSERT INTO queries (session_id, prompt, sql_query, summary, updated_columns, step_type) "
@@ -146,26 +148,37 @@ def _resolve_table_name(table_id: int) -> str:
 
 def _fetch_table_preview(table_id: int, limit: int = 200, offset: int = 0) -> dict:
     """
-    Runs SELECT * FROM [<resolved table name>] (bounded by `limit`), plus
-    a cheap COUNT(*) so the caller gets an exact total instead of the old
-    "rows.length >= limit" truncation guess on the client. table_name
-    comes from table_info (server-controlled), so it's safe to
-    interpolate into the identifier position; limit uses SELECT TOP, not
-    string-formatted into a value position.
+    Runs SELECT * against the table's own database (ours, or the client's custom
+    DB), bounded by `limit`, plus a cheap COUNT(*) so the caller gets an exact
+    total instead of the old "rows.length >= limit" truncation guess. table_name
+    comes from table_info (server-controlled); the row bound is interpolated as
+    a COUNT, never a user string.
     """
     table_name = _resolve_table_name(table_id)
 
     if limit < 0:
         raise HTTPException(status_code=400, detail="limit must be a non-negative integer")
 
+    table_ref = execution.quote_tsql(table_name)
     try:
-        rows = db.fetch(f"SELECT TOP {limit + offset} * FROM [{table_name}]")
-        total_count = db.get_single_value(f"SELECT COUNT(*) FROM [{table_name}]")
+        # A custom DB is queried remotely: clamp the TOP bound so a huge `limit`
+        # can't pull an unbounded result set across the network.
+        bound = limit + offset
+        if execution.resolve_table_source(table_id) is not None:
+            bound = min(bound, config.CUSTOM_DB_MAX_ROWS)
+
+        rows = execution.run_for_table(
+            table_id, f"SELECT TOP {bound} * FROM {table_ref}", limit=None
+        )["rows"]
+        total_count = execution.count_rows_for_table(table_id, table_name)
+        columns = execution.fetch_columns_for_table(table_id, table_name)
         result = {
-            "columns": db.fetch_with_columns(f"SELECT TOP 0 * FROM [{table_name}]")["columns"],
+            "columns": columns,
             "rows": rows[offset:],
-            "total_count": int(total_count) if total_count is not None else None,
+            "total_count": total_count,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Failed to fetch preview for table_id %s (%s)", table_id, table_name)
         raise HTTPException(status_code=500, detail=f"Failed to fetch table data: {str(e)}")

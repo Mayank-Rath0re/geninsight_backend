@@ -110,3 +110,26 @@ if ENV == "production" and not (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET and RAZO
 RUN_SCHEDULER = os.getenv("RUN_SCHEDULER", "1") == "1"
 PURGE_GRACE_DAYS = int(os.getenv("PURGE_GRACE_DAYS", "30"))      # hidden -> physically dropped
 DOWNGRADE_GRACE_DAYS = int(os.getenv("DOWNGRADE_GRACE_DAYS", "30"))  # no retention deletes right after a plan lapses
+
+# ---------------------------------------------------------------------------
+# Custom (client-owned) databases
+# ---------------------------------------------------------------------------
+# Fernet key used to encrypt stored DB passwords. If unset, a key is derived from
+# JWT_SECRET_KEY — rotating JWT_SECRET_KEY then makes existing stored credentials
+# unreadable, so set a dedicated DB_CREDENTIALS_KEY in production.
+DB_CREDENTIALS_KEY = os.getenv("DB_CREDENTIALS_KEY", "")
+
+CUSTOM_DB_CONNECT_TIMEOUT = int(os.getenv("CUSTOM_DB_CONNECT_TIMEOUT", "10"))
+CUSTOM_DB_QUERY_TIMEOUT = int(os.getenv("CUSTOM_DB_QUERY_TIMEOUT", "30"))
+# Hard cap on rows returned by a query against a custom DB (protects our process and
+# the client's database from unbounded result sets).
+CUSTOM_DB_MAX_ROWS = int(os.getenv("CUSTOM_DB_MAX_ROWS", "5000"))
+# Rows sampled per table when building its metadata/knowledge base at registration.
+CUSTOM_DB_SAMPLE_ROWS = int(os.getenv("CUSTOM_DB_SAMPLE_ROWS", "50"))
+CUSTOM_DB_MAX_TABLES_PER_SOURCE = int(os.getenv("CUSTOM_DB_MAX_TABLES_PER_SOURCE", "200"))
+
+# Block private/internal addresses for custom DB hosts unless explicitly allowed.
+# Defaults to allowed in development (local DBs) and blocked in production (SSRF guard).
+ALLOW_PRIVATE_DB_HOSTS = os.getenv(
+    "ALLOW_PRIVATE_DB_HOSTS", "0" if ENV == "production" else "1"
+) == "1"

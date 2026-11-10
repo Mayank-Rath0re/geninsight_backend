@@ -63,13 +63,22 @@ def is_safe_select(sql: str) -> tuple[bool, str]:
 
 
 _ERROR_PATTERNS = [
+    # Patterns cover SQL Server (message/number), MySQL (1054, 1064, ...) and
+    # Postgres (SQLSTATE 42703, 42P01, ...) so widgets/dashboards repair correctly
+    # regardless of which database executed the query.
     ("SQL_ORDER_BY", r"ORDER BY clause is invalid|\b1033\b", True),
-    ("SQL_SYNTAX", r"Incorrect syntax|\b(102|156)\b", True),
-    ("SQL_INVALID_COLUMN", r"Invalid column name|Invalid object name|\b(207|208)\b", True),
-    ("SQL_GROUP_BY", r"not contained in either an aggregate|\b8120\b", True),
-    ("SQL_CONVERSION", r"Conversion failed|Error converting|\b(245|8114)\b", True),
-    ("SQL_DIVIDE_BY_ZERO", r"Divide by zero|\b8134\b", True),
-    ("SQL_TIMEOUT", r"timeout|timed out", False),
+    ("SQL_SYNTAX", r"Incorrect syntax|syntax error|\b(102|156|1064|42601)\b", True),
+    ("SQL_INVALID_COLUMN",
+     r"Invalid column name|Invalid object name|Unknown column|doesn't exist|does not exist|"
+     r"\b(207|208|1054|1146|42703|42P01)\b", True),
+    ("SQL_GROUP_BY",
+     r"not contained in either an aggregate|\b(8120|1055|42803)\b", True),
+    ("SQL_CONVERSION",
+     r"Conversion failed|Error converting|Incorrect (?:integer|decimal|datetime) value|"
+     r"invalid input syntax|\b(245|8114|1292|1366|22P02|22007)\b", True),
+    ("SQL_DIVIDE_BY_ZERO",
+     r"divide by zero|division by zero|division by 0|\b(8134|1365|22012)\b", True),
+    ("SQL_TIMEOUT", r"timeout|timed out|statement timeout|query_canceled|\b(3024|57014)\b", False),
 ]
 
 

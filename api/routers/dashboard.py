@@ -145,7 +145,7 @@ def _dashboard_intent_basic_impl(payload: DashboardIntentBasicRequest, trace_id:
                 saved = None
             if saved:
                 saved, data = dashboard_service.build_dashboard(
-                    saved, table_name, metadata, knowledge_base, trace_id, allow_ai=False
+                    saved, table_id, table_name, metadata, knowledge_base, trace_id, allow_ai=False
                 )
                 if _any_ok(saved):
                     db.run(
@@ -166,7 +166,7 @@ def _dashboard_intent_basic_impl(payload: DashboardIntentBasicRequest, trace_id:
         )
         log_ai_event(trace_id, "dashboard.intent_generated", intent=spec)
 
-        spec, data = dashboard_service.build_dashboard(spec, table_name, metadata, knowledge_base, trace_id)
+        spec, data = dashboard_service.build_dashboard(spec, table_id, table_name, metadata, knowledge_base, trace_id)
 
         if existing_id:
             db.run(
@@ -248,7 +248,7 @@ def _update_dashboard_item_impl(payload: UpdateDashboardItemRequest, trace_id: s
         data = {}
         if edit["action"] == "updated":
             intent, data = dashboard_service.build_dashboard(
-                intent, table_name, metadata, knowledge_base, trace_id, only_ids={payload.item_id}
+                intent, row[0][1], table_name, metadata, knowledge_base, trace_id, only_ids={payload.item_id}
             )
             new_item = dashboard_service.find_item(intent, payload.item_id)[3]
             if new_item.get("status") != "ok":
@@ -384,7 +384,7 @@ def _dashboard_data_impl(dashboard_id: int, userId: int, allow_repair: bool, tra
         intent = json.loads(row[0][0])
         table_name, metadata_raw, kb_raw = _load_table_context(row[0][1])
         spec, data = dashboard_service.build_dashboard(
-            intent, table_name, json.loads(metadata_raw), json.loads(kb_raw), trace_id, allow_ai=allow_repair
+            intent, row[0][1], table_name, json.loads(metadata_raw), json.loads(kb_raw), trace_id, allow_ai=allow_repair
         )
 
         db.run(
@@ -450,7 +450,7 @@ def share_dashboard(payload: ShareDashboardRequest, authed_user_id: int = Depend
 
         table_name, metadata_raw, kb_raw = _load_table_context(table_id)
         spec, data = dashboard_service.build_dashboard(
-            json.loads(intent_raw), table_name, json.loads(metadata_raw), json.loads(kb_raw),
+            json.loads(intent_raw), table_id, table_name, json.loads(metadata_raw), json.loads(kb_raw),
             trace_id, allow_ai=False,
         )
         snapshot = dashboard_service.public_snapshot(spec, data)

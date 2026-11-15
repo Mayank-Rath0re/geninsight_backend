@@ -13,8 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core import config, context_propagation
 from routers import (
-    auth, billing, charts, dashboard, data_sources, datasets, merge, organizations, public, query,
-    sessions, transform,
+    auth, billing, charts, dashboard, data_sources, datasets, export, merge, organizations, public,
+    query, sessions, settings, transform,
 )
 from services import retention
 
@@ -55,6 +55,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # The export download reads these from the response in the browser.
+    expose_headers=["Content-Disposition", "X-Export-Rows"],
 )
 
 app.include_router(auth.router)
@@ -69,6 +71,8 @@ app.include_router(public.router)
 app.include_router(billing.router)
 app.include_router(organizations.router)
 app.include_router(data_sources.router)
+app.include_router(settings.router)
+app.include_router(export.router)
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -154,9 +154,16 @@ def perform_merge(target_session_id: int, source_session_id: int, user_id: int, 
             source_context=source_kb,
             user_hint=user_hint,
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Merge SQL generation failed (target=%s, source=%s)", target_session_id, source_session_id)
-        raise HTTPException(status_code=500, detail=f"Merge generation failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "MERGE_GENERATION_FAILED",
+                "message": "We couldn't work out how to join those datasets. Try giving a hint about the matching column.",
+                "retryable": True,
+            },
+        )
 
     sql_query = merge_result["sql"]
     if "Requested fields not found in schema" in sql_query:
@@ -232,6 +239,13 @@ def perform_merge(target_session_id: int, source_session_id: int, user_id: int, 
 
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("Merge failed (target=%s, source=%s)", target_session_id, source_session_id)
-        raise HTTPException(status_code=500, detail=f"Merge failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "MERGE_FAILED",
+                "message": "We couldn't finish joining those datasets. Please try again.",
+                "retryable": True,
+            },
+        )

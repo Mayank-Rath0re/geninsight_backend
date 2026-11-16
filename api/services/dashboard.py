@@ -1,4 +1,5 @@
 import json
+import logging
 
 from core import json_utils
 from core.ai_trace import log_ai_event
@@ -6,6 +7,8 @@ from core.sql_safety import classify_sql_error, is_safe_select, sanitize_sql
 from services import llm_client
 from services.custom_db import execution
 from services.query_generation import ORDER_BY_RULES
+
+logger = logging.getLogger("my_global_app_logger")
 
 MAX_DASH_ROWS = 1000
 
@@ -99,7 +102,7 @@ Rules:
 4. Only use column names from AVAILABLE COLUMNS.
 5. Return ONLY valid JSON."""
     raw = llm_client.ask_llm(system, user)
-    print(f"LLM Response for Dashboard Intent: {raw}")
+    logger.debug("Dashboard intent response: %s", raw)
     return json_utils.extract_json_object(raw)
 
 def _needs_sql(item: dict) -> bool:
@@ -324,7 +327,7 @@ def apply_dashboard_feedback(dashboard_intent: dict, feedback: str, metadata: st
         updated["clarification_questions"] = []
         return updated
     except Exception:
-        print("\n  Failed to parse LLM response. Keeping original dashboard.")
+        logger.warning("Failed to parse dashboard feedback response; keeping the original dashboard")
         return dashboard_intent
 
 DATA_KEYS = (

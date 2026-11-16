@@ -13,13 +13,20 @@ replaces the old lazy "session is created on first /transform call" and
 
 import csv
 import json
+import logging
 import os
+import re
+import uuid
 
 from fastapi import HTTPException, UploadFile, status
 
 from core import db
 from core.config import UPLOAD_DIR
 from services import ingestion
+
+logger = logging.getLogger("my_global_app_logger")
+
+MAX_TABLE_NAME_LEN = 120
 
 
 def _cast(value: str, col: str, sample_rows: list) -> object:
@@ -39,6 +46,25 @@ def _cast(value: str, col: str, sample_rows: list) -> object:
     return value
 
 
+def _unique_table_name(base: str) -> str:
+    """Same filename uploaded twice must not append rows into the first table."""
+    candidate = base[:MAX_TABLE_NAME_LEN]
+    suffix = 2
+    while db.get_single_value("SELECT id FROM table_info WHERE name = %s", (candidate,)) is not None:
+        tail = f"_{suffix}"
+        candidate = base[: MAX_TABLE_NAME_LEN - len(tail)] + tail
+        suffix += 1
+    return candidate
+
+
+def _table_name_for(user_id: int, filename: str) -> str:
+    # Filenames are user input and end up inside SQL identifiers/string
+    # literals (generate_sql_schema), so keep only [A-Za-z0-9_].
+    stem = os.path.splitext(filename)[0]
+    safe_stem = re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_") or "dataset"
+    return _unique_table_name(f"user{user_id}_{safe_stem}")
+
+
 async def ingest_table_and_session(
     user_id: int,
     file: UploadFile,
@@ -52,42 +78,73 @@ async def ingest_table_and_session(
 
     Returns {"table_id", "table_name", "session_id", "session_title", "query_id"}.
     """
-    ext = file.filename.split(".")[-1].lower()
+    # The client controls the filename: strip any directory component so a name
+    # like "../../x.csv" can never escape UPLOAD_DIR.
+    filename = os.path.basename((file.filename or "").replace("\\", "/"))
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext not in ["csv", "xlsx"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid file format. Only csv and xlsx files are allowed.",
         )
 
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-    table_name = (f"user{user_id}_" + file.filename).replace(".", "_").replace("@", "_")
+    file_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}_{filename}")
+    table_name = _table_name_for(user_id, filename)
 
     contents = await file.read()
     with open(file_path, "wb") as f:
         f.write(contents)
 
-    df = ingestion.get_dataframe(file_path)
+    try:
+        df = ingestion.get_dataframe(file_path)
+    except Exception:
+        logger.exception("Could not parse uploaded file %s", filename)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "INVALID_FILE", "message": "That file couldn't be read as a table. Check the format and try again.", "retryable": False},
+        )
+    if df is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "UNSUPPORTED_FILE", "message": "Only CSV and XLSX files are supported.", "retryable": False},
+        )
     df = ingestion.sanitize_columns(df)
+    if df.empty:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "EMPTY_DATASET", "message": "That file has no data rows to analyze.", "retryable": False},
+        )
     if apply_basic_transformation:
         df = ingestion.basic_transform(df)
+    if df.shape[1] == 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "EMPTY_SCHEMA",
+                "message": "Automatic cleanup would remove every column. Try uploading without clean-up.",
+                "retryable": False,
+            },
+        )
     df.to_csv(file_path, index=False)
 
     metadata = ingestion.extract_metadata(file_path)
     roles = ingestion.classify_column_roles(df, metadata)
     columns = list(df.columns)
-    print("=== CALLING AI: Building Knowledge Base + session_title (1 call)")
-    kb_result = ingestion.build_knowledge_base(df.head(5), metadata, table_name, roles)
+    # Full dataframe: the knowledge base's row_count/statistics must describe the
+    # whole dataset (it samples head(5) internally for the prompt).
+    kb_result = ingestion.build_knowledge_base(df, metadata, table_name, roles)
     kb = kb_result["knowledge_base"]
     session_title = kb_result["session_title"]
     del df
 
     conn = db.get_connection()
+    cursor = None
     try:
         cursor = conn.cursor()
 
         cursor.execute("SELECT id FROM auth WHERE id = %s", (user_id,))
         if not cursor.fetchone():
-            raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+            raise HTTPException(status_code=404, detail="User not found.")
 
         schema = db.generate_sql_schema(table_name, file_path)
         cursor.execute(schema)
@@ -137,7 +194,7 @@ async def ingest_table_and_session(
                 new_session_id,
                 "Load data",
                 select_sql,
-                f"Loaded {file.filename}",
+                f"Loaded {filename}",
                 json.dumps(columns),
                 "transform",
             ),
@@ -151,9 +208,11 @@ async def ingest_table_and_session(
         raise
     except Exception:
         conn.rollback()
+        logger.exception("Table ingestion failed for user %s (table %s)", user_id, table_name)
         raise
     finally:
-        cursor.close()
+        if cursor is not None:
+            cursor.close()
         conn.close()
 
     return {

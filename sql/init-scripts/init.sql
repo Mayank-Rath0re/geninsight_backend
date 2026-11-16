@@ -222,6 +222,33 @@ BEGIN
 END
 GO
 
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='analyst_reports' AND xtype='U')
+BEGIN
+    CREATE TABLE analyst_reports (
+        report_id     INT IDENTITY(1,1) PRIMARY KEY,
+        user_id       INT NULL,
+        table_id      INT NOT NULL,
+        title         NVARCHAR(200) NOT NULL,
+        payload       NVARCHAR(MAX) NOT NULL,
+        is_shared     BIT NOT NULL DEFAULT 0,
+        share_token   VARCHAR(64) NULL,
+        shared_snapshot NVARCHAR(MAX) NULL,
+        shared_at     DATETIME2 NULL,
+        is_deleted    BIT NOT NULL DEFAULT 0,
+        deleted_at    DATETIME2 NULL,
+        created_at    DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+        updated_at    DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+        CONSTRAINT fk_analyst_reports_user FOREIGN KEY (user_id)
+            REFERENCES auth(id) ON DELETE CASCADE,
+        CONSTRAINT fk_analyst_reports_table FOREIGN KEY (table_id)
+            REFERENCES table_info(id) ON DELETE NO ACTION
+    );
+    CREATE INDEX ix_analyst_reports_user_table ON analyst_reports(user_id, table_id);
+    CREATE UNIQUE INDEX uq_analyst_reports_share_token ON analyst_reports(share_token)
+        WHERE share_token IS NOT NULL;
+END
+GO
+
 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='dashboard_charts' AND xtype='U')
 BEGIN
     CREATE TABLE dashboard_charts (

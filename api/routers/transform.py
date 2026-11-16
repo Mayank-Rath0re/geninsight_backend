@@ -75,18 +75,37 @@ def _transform_impl(payload: models.TransformPayload, trace_id: str) -> dict:
 
             placeholders = ", ".join(["%s"] * len(tables))
             cur.execute(
-                f"SELECT id, name, user_id, knowledgebase, metadata "
+                f"SELECT id, name, user_id, knowledgebase, metadata, is_deleted "
                 f"FROM table_info WHERE id IN ({placeholders})",
                 tuple(tables),
             )
             tables_rows = cur.fetchall()
-            if not tables_rows:
-                raise HTTPException(status_code=404, detail="No matching tables found.")
+            if not tables_rows or len(tables_rows) != len(set(tables)):
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "TABLE_NOT_FOUND",
+                            "message": "One of those datasets no longer exists.",
+                            "retryable": False},
+                )
+            if any(row[5] for row in tables_rows):
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "TABLE_NOT_FOUND",
+                            "message": "One of those datasets no longer exists.",
+                            "retryable": False},
+                )
 
             tables_info = [
                 {"user_id": row[2], "knowledgebase": row[3], "metadata": row[4], "name": row[1]}
                 for row in tables_rows
             ]
+            if any(row[2] != userId for row in tables_rows):
+                raise HTTPException(
+                    status_code=403,
+                    detail={"code": "FORBIDDEN",
+                            "message": "You don't have access to one of those tables.",
+                            "retryable": False},
+                )
 
             previous_query_data = None
             cur.execute(
@@ -206,6 +225,15 @@ def _transform_impl(payload: models.TransformPayload, trace_id: str) -> dict:
 
     except HTTPException:
         raise
-    except Exception as e:
-        logger.exception("Transform failed for user %s", userId)
-        raise HTTPException(status_code=500, detail=f"Transform failed: {str(e)}")
+    except Exception:
+        logger.exception("Transform failed for user %s (trace %s)", userId, trace_id)
+        log_ai_event(trace_id, "transform.failed", level="error", prompt=payload.prompt)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "TRANSFORM_FAILED",
+                "message": "Something went wrong while running that step. Please try again.",
+                "retryable": True,
+                "trace_id": trace_id,
+            },
+        )

@@ -42,3 +42,32 @@ def shared_dashboard(token: str):
         },
         headers={"Cache-Control": "no-store"},
     )
+
+
+@router.get("/shared_analyst_report", dependencies=[Depends(limiter)])
+def shared_analyst_report(token: str):
+    if not TOKEN_PATTERN.match(token):
+        raise HTTPException(status_code=404, detail="This link is no longer available.")
+
+    rows = db.fetch(
+        "SELECT shared_snapshot, shared_at FROM analyst_reports "
+        "WHERE share_token = %s AND is_shared = 1 AND is_deleted = 0",
+        params=(token,),
+    )
+    if not rows or not rows[0][0]:
+        raise HTTPException(status_code=404, detail="This link is no longer available.")
+
+    try:
+        snapshot = json.loads(rows[0][0])
+    except ValueError:
+        logger.exception("Corrupt shared analyst snapshot")
+        raise HTTPException(status_code=404, detail="This link is no longer available.")
+
+    shared_at = rows[0][1]
+    return JSONResponse(
+        content={
+            "report": snapshot,
+            "shared_at": shared_at.isoformat() if shared_at else None,
+        },
+        headers={"Cache-Control": "no-store"},
+    )

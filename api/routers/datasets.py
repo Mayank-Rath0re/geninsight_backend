@@ -6,6 +6,7 @@ import logging
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
 from core import config, db
+from core.ai_trace import log_ai_event, new_trace_id
 from core.security import get_current_user_id, require_same_user
 from services import usage_service
 from services.custom_db import execution
@@ -13,6 +14,11 @@ from services.table_ingest import ingest_table_and_session
 
 logger = logging.getLogger("my_global_app_logger")
 router = APIRouter(tags=["datasets"])
+
+
+def _error(status_code: int, code: str, message: str, retryable: bool = False, **extra) -> HTTPException:
+    detail = {"code": code, "message": message, "retryable": retryable, **extra}
+    return HTTPException(status_code=status_code, detail=detail)
 
 
 @router.get("/user_datasets")
@@ -31,7 +37,7 @@ def get_user_datasets(userId: int, authed_user_id: int = Depends(get_current_use
         ]
     except Exception:
         logger.exception("Failed to fetch datasets for user %s", userId)
-        raise HTTPException(status_code=500, detail="Failed to fetch datasets!")
+        raise _error(500, "DATASETS_FAILED", "We couldn't load your datasets. Please try again.", retryable=True)
 
 
 @router.post("/upload", status_code=status.HTTP_201_CREATED)
@@ -51,11 +57,12 @@ async def upload_dataset(
     Free monthly query cap does not block them.
     """
     require_same_user(authed_user_id, userId)
+    trace_id = new_trace_id()
     try:
         usage_service.assert_can_upload(userId)
         usage_service.check_quota(userId, include_queries=False)
 
-        with usage_service.metered_call(userId, "upload") as meter:
+        with usage_service.metered_call(userId, "upload", trace_id) as meter:
             result = await ingest_table_and_session(
                 user_id=userId,
                 file=file,
@@ -69,11 +76,17 @@ async def upload_dataset(
         }
     except HTTPException:
         raise
-    except Exception as e:
-        logger.exception("Upload failed for user %s, file %s", userId, file.filename)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred while processing the dataset: {str(e)}",
+    except Exception:
+        logger.exception(
+            "Upload failed for user %s, file %s (trace %s)", userId, file.filename, trace_id
+        )
+        log_ai_event(trace_id, "upload.failed", level="error", filename=file.filename)
+        raise _error(
+            500,
+            "UPLOAD_FAILED",
+            "We couldn't process that file. Check that it is a valid CSV/XLSX and try again.",
+            retryable=True,
+            trace_id=trace_id,
         )
     finally:
         await file.close()
@@ -90,9 +103,9 @@ def create_session_for_table(userId: int, tableId: int, authed_user_id: int = De
     require_same_user(authed_user_id, userId)
     row = db.fetch("SELECT user_id, is_deleted FROM table_info WHERE id = %s", (tableId,))
     if not row or row[0][1]:
-        raise HTTPException(status_code=404, detail=f"Table {tableId} not found")
+        raise _error(404, "TABLE_NOT_FOUND", "That dataset no longer exists.")
     if row[0][0] != userId:
-        raise HTTPException(status_code=401, detail="User Mismatch")
+        raise _error(403, "FORBIDDEN", "You don't have access to this dataset.")
 
     table_name = _resolve_table_name(tableId)
     table_ref = execution.quote_tsql(table_name)
@@ -134,15 +147,23 @@ def create_session_for_table(userId: int, tableId: int, authed_user_id: int = De
         }
     except HTTPException:
         raise
-    except Exception as e:
-        logger.exception("create_session_for_table failed for user %s, table %s", userId, tableId)
-        raise HTTPException(status_code=500, detail=f"Failed to create session: {str(e)}")
+    except Exception:
+        trace_id = new_trace_id()
+        logger.exception(
+            "create_session_for_table failed for user %s, table %s (trace %s)", userId, tableId, trace_id
+        )
+        log_ai_event(trace_id, "session_create.failed", level="error", table_id=tableId)
+        raise _error(
+            500, "SESSION_CREATE_FAILED",
+            "We couldn't start a session for that dataset. Please try again.",
+            retryable=True, trace_id=trace_id,
+        )
 
 
 def _resolve_table_name(table_id: int) -> str:
     name = db.get_single_value("SELECT name FROM table_info WHERE id = %s", (table_id,))
     if not name:
-        raise HTTPException(status_code=404, detail=f"Table {table_id} not found")
+        raise _error(404, "TABLE_NOT_FOUND", "That dataset no longer exists.")
     return name
 
 
@@ -157,7 +178,9 @@ def _fetch_table_preview(table_id: int, limit: int = 200, offset: int = 0) -> di
     table_name = _resolve_table_name(table_id)
 
     if limit < 0:
-        raise HTTPException(status_code=400, detail="limit must be a non-negative integer")
+        raise _error(400, "INVALID_LIMIT", "limit must be a non-negative integer.")
+    if offset < 0:
+        raise _error(400, "INVALID_OFFSET", "offset must be a non-negative integer.")
 
     table_ref = execution.quote_tsql(table_name)
     try:
@@ -179,9 +202,17 @@ def _fetch_table_preview(table_id: int, limit: int = 200, offset: int = 0) -> di
         }
     except HTTPException:
         raise
-    except Exception as e:
-        logger.exception("Failed to fetch preview for table_id %s (%s)", table_id, table_name)
-        raise HTTPException(status_code=500, detail=f"Failed to fetch table data: {str(e)}")
+    except Exception:
+        trace_id = new_trace_id()
+        logger.exception(
+            "Failed to fetch preview for table_id %s (%s) (trace %s)", table_id, table_name, trace_id
+        )
+        log_ai_event(trace_id, "preview.failed", level="error", table_id=table_id)
+        raise _error(
+            500, "PREVIEW_FAILED",
+            "We couldn't load this dataset's rows. Please try again.",
+            retryable=True, trace_id=trace_id,
+        )
 
     return {"headers": result["columns"], "rows": result["rows"], "total_count": result["total_count"]}
 
@@ -189,9 +220,9 @@ def _fetch_table_preview(table_id: int, limit: int = 200, offset: int = 0) -> di
 def _check_table_owner(table_id: int, authed_user_id: int) -> None:
     row = db.fetch("SELECT user_id, is_deleted FROM table_info WHERE id = %s", (table_id,))
     if not row or row[0][1]:
-        raise HTTPException(status_code=404, detail=f"Table {table_id} not found")
+        raise _error(404, "TABLE_NOT_FOUND", "That dataset no longer exists.")
     if row[0][0] != authed_user_id:
-        raise HTTPException(status_code=401, detail="User Mismatch")
+        raise _error(403, "FORBIDDEN", "You don't have access to this dataset.")
 
 
 @router.get("/table_preview")

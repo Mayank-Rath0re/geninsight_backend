@@ -90,9 +90,12 @@ def session_info(sessionId: int, userId: int, authed_user_id: int = Depends(get_
 
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to fetch session %s", sessionId)
-        raise HTTPException(status_code=500, detail=f"Failed to fetch session: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "SESSION_LOAD_FAILED", "message": "We couldn't load that session. Please try again.", "retryable": True},
+        )
 
 
 @router.get("/user_sessions")
@@ -101,17 +104,24 @@ def get_user_sessions(userId: int, search: str = "", all_mode: bool = False, aut
     try:
         has_search = search != ""
         top_clause = "" if all_mode else "TOP 20 "
-        query = f"SELECT {top_clause}session_id, session_title, date_modified FROM sessions WHERE user_id = %s AND is_deleted=0"
+        query = (
+            f"SELECT {top_clause}s.session_id, s.session_title, s.date_modified, "
+            "(SELECT COUNT(*) FROM queries q "
+            " WHERE q.session_id = s.session_id AND q.is_deleted = 0) AS step_count "
+            "FROM sessions s WHERE s.user_id = %s AND s.is_deleted = 0"
+        )
         if has_search:
-            query += " AND session_title LIKE %s"
+            query += " AND s.session_title LIKE %s"
+        query += " ORDER BY s.date_modified DESC, s.session_id DESC"
         params = (userId, f"%{search}%") if has_search else (userId,)
         rows = db.fetch(query, params=params)
-        print(f"Total sessions for userId {userId}: {len(rows)}")
+        logger.debug("user_sessions: %s sessions for user %s", len(rows), userId)
         if not rows:
             return {"history": []}
         return {"history": rows}
     except Exception:
-        raise HTTPException(status_code=400, detail="Error fetching history!")
+        logger.exception("Failed to list sessions for user %s", userId)
+        raise HTTPException(status_code=500, detail="Couldn't load your sessions. Please try again.")
 
 
 @router.post("/update_modified")
@@ -169,17 +179,28 @@ def pipeline_result(sessionId: int, userId: int, queryId: int, authed_user_id: i
         try:
             output = pipeline.run_pipeline_result(sessionId, queryId)
         except ValueError as e:
-            raise HTTPException(status_code=422, detail=str(e))
+            logger.warning("Pipeline result invalid for session %s, query %s: %s", sessionId, queryId, e)
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "PIPELINE_INCOMPLETE",
+                    "message": "That step's data couldn't be recomputed. Try rolling back to an earlier step.",
+                    "retryable": False,
+                },
+            )
 
         return {"sessionId": sessionId, "queryId": queryId, "data": output}
 
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception(
             "Pipeline result failed for session %s, query %s", sessionId, queryId
         )
-        raise HTTPException(status_code=500, detail=f"Pipeline result failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "PIPELINE_FAILED", "message": "We couldn't recompute that step. Please try again.", "retryable": True},
+        )
 
 
 class RollbackRequest(BaseModel):
@@ -220,6 +241,15 @@ def rollback_transform(payload: RollbackRequest, authed_user_id: int = Depends(g
                 raise HTTPException(status_code=404, detail="Query not found in session")
 
             cut = ordered_ids.index(queryId)
+            if cut == 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "BASE_STEP",
+                        "message": "The first step can't be rolled back — it loads the dataset this session depends on.",
+                        "retryable": False,
+                    },
+                )
             to_remove = ordered_ids[cut:]
 
             placeholders = ", ".join(["%s"] * len(to_remove))
@@ -232,6 +262,9 @@ def rollback_transform(payload: RollbackRequest, authed_user_id: int = Depends(g
 
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("Rollback failed for session %s, query %s", sessionId, queryId)
-        raise HTTPException(status_code=500, detail=f"Rollback failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "ROLLBACK_FAILED", "message": "We couldn't undo that step. Please try again.", "retryable": True},
+        )

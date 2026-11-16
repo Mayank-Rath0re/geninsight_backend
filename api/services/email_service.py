@@ -3,6 +3,7 @@
 OTP email delivery and verification.
 """
 
+import logging
 import secrets
 import smtplib
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,8 @@ from fastapi import HTTPException
 from core import config, db
 
 load_dotenv()
+
+logger = logging.getLogger("my_global_app_logger")
 
 
 def send_otp_mail(receiver_mail: str, usageCode: str):
@@ -109,9 +112,9 @@ def send_otp_mail(receiver_mail: str, usageCode: str):
         inserted_time = datetime.now(timezone.utc)
         insert_query = "INSERT INTO OTP(email_id, otp_no, usageCode, insertedTime) VALUES(%s, %s, %s, %s)"
         db.run(insert_query, (receiver_mail, otp, usageCode, inserted_time))
-        print(f"-- Email sent to: {receiver_mail}")
-    except Exception as e:
-        print(f"-- OTP send failed: {type(e).__name__}: {e}")
+        logger.info("OTP email sent")
+    except Exception:
+        logger.exception("OTP email delivery failed")
         raise HTTPException(status_code=400, detail="Error sending mail. Please try again later.")
 
 

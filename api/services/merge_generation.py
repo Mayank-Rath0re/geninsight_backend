@@ -11,10 +11,13 @@ caused reliability regressions, so it's back to plan-then-generate.
 """
 
 import json
+import logging
 
 from core import json_utils
 from services import llm_client
 from services.query_generation import sanitize_llm_sql
+
+logger = logging.getLogger("my_global_app_logger")
 
 
 def merge_plan_instructions(
@@ -87,7 +90,7 @@ Return exactly this JSON structure:
 
     raw = llm_client.ask_llm(sys_prompt, user_prompt)
     plan = json_utils.extract_json_object(raw)
-    print("-- Merge Plan Generated: ", json.dumps(plan, indent=2))
+    logger.debug("Merge plan: %s", json.dumps(plan))
     return plan
 
 
@@ -160,7 +163,7 @@ User hint (for reference only — follow the PLAN above): {user_hint or "(none p
 """
 
     raw = llm_client.ask_llm(sys_prompt, user_prompt)
-    print("-- Merge SQL Generated: ", raw)
+    logger.debug("Generated merge SQL response: %s", raw)
     result = json_utils.extract_json_object(raw)
 
     sql = sanitize_llm_sql(result["sql"])
@@ -174,9 +177,9 @@ User hint (for reference only — follow the PLAN above): {user_hint or "(none p
     planned_cols = plan.get("select_columns") or result["columns"]
     reported_cols = result["columns"]
     if set(reported_cols) != set(planned_cols):
-        print(
-            f"-- WARNING: generated merge SQL columns {reported_cols} do not match "
-            f"planned columns {planned_cols}. Using planned columns for pipeline schema tracking."
+        logger.warning(
+            "Generated merge SQL columns %s do not match planned columns %s; using planned "
+            "columns for pipeline schema tracking", reported_cols, planned_cols,
         )
         columns_out = planned_cols
     else:

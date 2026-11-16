@@ -107,9 +107,12 @@ def create_data_source(payload: CreateDataSourceRequest,
         return source_service.create_source(payload.userId, raw, selected_tables=selected)
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to add data source for user %s", payload.userId)
-        raise HTTPException(status_code=500, detail=f"Failed to add database: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "DATA_SOURCE_CREATE_FAILED", "message": "We couldn't connect to that database. Check the credentials and try again.", "retryable": True},
+        )
 
 
 @router.post("/update_data_source")
@@ -124,9 +127,12 @@ def update_data_source(payload: UpdateDataSourceRequest,
         )
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to update data source %s", payload.data_source_id)
-        raise HTTPException(status_code=500, detail=f"Failed to update database: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "DATA_SOURCE_UPDATE_FAILED", "message": "We couldn't update that database connection. Please try again.", "retryable": True},
+        )
 
 
 @router.post("/delete_data_source")
@@ -137,9 +143,12 @@ def delete_data_source(payload: DataSourceIdRequest,
         return source_service.delete_source(payload.userId, payload.data_source_id)
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to delete data source %s", payload.data_source_id)
-        raise HTTPException(status_code=500, detail=f"Failed to remove database: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "DATA_SOURCE_DELETE_FAILED", "message": "We couldn't remove that database connection. Please try again.", "retryable": True},
+        )
 
 
 @router.get("/data_source_tables")

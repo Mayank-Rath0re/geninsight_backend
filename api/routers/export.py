@@ -134,12 +134,18 @@ def _pipeline_data(session_id: int, query_id: int, user_id: int):
     if not row:
         raise HTTPException(status_code=404, detail="Session not found.")
     if row[0][0] != user_id:
-        raise HTTPException(status_code=401, detail="User Mismatch")
+        raise HTTPException(status_code=403, detail={"code": "FORBIDDEN", "message": "You don't have access to this session.", "retryable": False})
 
     try:
         result = pipeline.run_pipeline_result(session_id, query_id)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        logger.warning("Export pipeline invalid for session %s, query %s: %s", session_id, query_id, exc)
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "PIPELINE_INCOMPLETE",
+                    "message": "That step's data couldn't be recomputed. Try exporting an earlier step.",
+                    "retryable": False},
+        )
     return result["columns"], result["rows"], row[0][1] or "dataset"
 
 
@@ -151,7 +157,7 @@ def _table_data(table_id: int, user_id: int):
     if not row:
         raise HTTPException(status_code=404, detail="Dataset not found.")
     if row[0][0] != user_id:
-        raise HTTPException(status_code=401, detail="User Mismatch")
+        raise HTTPException(status_code=403, detail={"code": "FORBIDDEN", "message": "You don't have access to this dataset.", "retryable": False})
 
     table_name = row[0][1]
     result = execution.run_for_table(
@@ -201,6 +207,9 @@ def export_data(
 
     except HTTPException:
         raise
-    except Exception as exc:
+    except Exception:
         logger.exception("Export failed (session=%s, table=%s)", session_id, table_id)
-        raise HTTPException(status_code=500, detail=f"Export failed: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "EXPORT_FAILED", "message": "The export couldn't be generated. Please try again.", "retryable": True},
+        )

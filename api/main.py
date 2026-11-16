@@ -13,8 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core import config, context_propagation
 from routers import (
-    auth, billing, charts, dashboard, data_sources, datasets, export, merge, organizations, public,
-    query, sessions, settings, transform,
+    analyst, auth, billing, charts, dashboard, data_sources, datasets, export, merge,
+    organizations, public, query, sessions, settings, transform,
 )
 from services import retention
 
@@ -65,6 +65,7 @@ app.include_router(sessions.router)
 app.include_router(transform.router)
 app.include_router(merge.router)
 app.include_router(dashboard.router)
+app.include_router(analyst.router)
 app.include_router(charts.router)
 app.include_router(query.router)
 app.include_router(public.router)

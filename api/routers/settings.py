@@ -146,6 +146,12 @@ def get_usage(authed_user_id: int = Depends(get_current_user_id)):
             "shared_dashboards": _count(
                 "SELECT COUNT(*) FROM dashboards WHERE user_id = %s AND is_deleted = 0 AND is_shared = 1", uid
             ),
+            "analyst_reports": _count(
+                "SELECT COUNT(*) FROM analyst_reports WHERE user_id = %s AND is_deleted = 0", uid
+            ),
+            "shared_analyst_reports": _count(
+                "SELECT COUNT(*) FROM analyst_reports WHERE user_id = %s AND is_deleted = 0 AND is_shared = 1", uid
+            ),
         },
     }
 
@@ -262,6 +268,12 @@ def delete_account(payload: DeleteAccountRequest, authed_user_id: int = Depends(
         )
         cur.execute(
             "UPDATE sessions SET is_deleted = 1, deleted_at = SYSDATETIME() "
+            "WHERE user_id = %s AND is_deleted = 0",
+            (authed_user_id,),
+        )
+        cur.execute(
+            "UPDATE analyst_reports SET is_deleted = 1, deleted_at = SYSDATETIME(), "
+            "is_shared = 0, share_token = NULL, shared_snapshot = NULL, shared_at = NULL "
             "WHERE user_id = %s AND is_deleted = 0",
             (authed_user_id,),
         )

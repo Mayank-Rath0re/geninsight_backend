@@ -7,12 +7,15 @@ call), and the optional basic auto-cleaning transform.
 """
 
 import json
+import logging
 from typing import Any, Dict
 
 import pandas as pd
 
 from core import json_utils
 from services import llm_client
+
+logger = logging.getLogger("my_global_app_logger")
 
 UNIQUE_VALUES_THRESHOLD = 20
 
@@ -114,11 +117,12 @@ def classify_column_roles(df: pd.DataFrame, metadata: str) -> str:
 
         if dtype == "object":
             if cardinality < 0.05:
+                values = meta.get("all_possible_values") or meta.get("sample_values") or []
                 roles[col] = {
                     "role": "dimension",
                     "advice": (
                         f"Categorical dimension with {unique_ct} unique values. "
-                        f"Ideal for GROUP BY. Sample: {meta['sample_values'][:3]}"
+                        f"Ideal for GROUP BY. Values: {values[:10]}"
                     ),
                 }
             else:
@@ -132,6 +136,79 @@ def classify_column_roles(df: pd.DataFrame, metadata: str) -> str:
     return json.dumps(roles, indent=2, default=str)
 
 
+def _humanize_table_name(table_name: str) -> str:
+    """'user3_quarterly_sales_xlsx' -> 'Quarterly Sales Xlsx'."""
+    parts = [p for p in table_name.split("_") if p]
+    if parts and parts[0].startswith("user") and parts[0][4:].isdigit():
+        parts = parts[1:]
+    return " ".join(p.capitalize() for p in parts) or "Dataset"
+
+
+def _default_session_title(table_name: str) -> str:
+    return f"{_humanize_table_name(table_name)[:60]} Analysis"
+
+
+def _column_families(metadata: str, columns: list) -> tuple[list, list, list]:
+    meta = json.loads(metadata)
+    numeric, dates = [], []
+    for col in columns:
+        dtype = str(meta.get(col, {}).get("dtype", ""))
+        col_lower = col.lower()
+        if dtype.startswith("datetime") or any(t in col_lower for t in ("date", "time", "dt")):
+            dates.append(col)
+        elif dtype.startswith(("int", "float")):
+            numeric.append(col)
+    categorical = [c for c in columns if c not in numeric and c not in dates]
+    return numeric, dates, categorical
+
+
+def _fallback_knowledge_base(
+    df: pd.DataFrame, metadata: str, table_name: str, roles: str
+) -> dict:
+    """Deterministic knowledge base used when the LLM call or JSON parse fails,
+    so an upload never hard-fails because a provider is down."""
+    columns = list(df.columns)
+    numeric, dates, categorical = _column_families(metadata, columns)
+    kb_dict = {
+        "columns_name": columns,
+        "table_name": table_name,
+        "domain": "unclassified",
+        "description": (
+            f"Dataset '{_humanize_table_name(table_name)}' with {df.shape[0]} rows "
+            f"and {df.shape[1]} columns: {', '.join(map(str, columns[:10]))}."
+        ),
+        "row_count": int(df.shape[0]),
+        "column_count": int(df.shape[1]),
+        "key_columns": (numeric[:3] + categorical[:2]) or columns[:5],
+        "date_columns": dates,
+        "numeric_columns": numeric,
+        "categorical_columns": categorical,
+        "data_quality_notes": "Automatic profile — generated without AI.",
+        "potential_analyses": [],
+        "column_roles": json.loads(roles),
+    }
+    return {"knowledge_base": json.dumps(kb_dict), "session_title": _default_session_title(table_name)}
+
+
+def _sanitize_kb(kb_dict: dict, df: pd.DataFrame, metadata: str, table_name: str, roles: str) -> dict:
+    """Overwrite model-reported structure with ground truth from the dataframe so a
+    hallucinated column, row count, or table name can never reach the SQL planner."""
+    columns = list(df.columns)
+    numeric, dates, categorical = _column_families(metadata, columns)
+    kb_dict["columns_name"] = columns
+    kb_dict["table_name"] = table_name
+    kb_dict["row_count"] = int(df.shape[0])
+    kb_dict["column_count"] = int(df.shape[1])
+    kb_dict["numeric_columns"] = [c for c in kb_dict.get("numeric_columns") or [] if c in numeric] or numeric
+    kb_dict["date_columns"] = [c for c in kb_dict.get("date_columns") or [] if c in dates] or dates
+    kb_dict["categorical_columns"] = [
+        c for c in kb_dict.get("categorical_columns") or [] if c in categorical
+    ] or categorical
+    kb_dict["key_columns"] = [c for c in kb_dict.get("key_columns") or [] if c in columns] or columns[:5]
+    kb_dict["column_roles"] = json.loads(roles)
+    return kb_dict
+
+
 def build_knowledge_base(
     df: pd.DataFrame,
     metadata: str,
@@ -143,10 +220,17 @@ def build_knowledge_base(
     session title (session_title), so staging a session never needs a
     second, dedicated "name this session" call.
 
+    Pass the FULL dataframe: row_count/describe must reflect the whole
+    dataset, not a sample. On LLM or JSON failure this returns a
+    deterministic, metadata-derived knowledge base instead of raising.
+
     Returns a dict with keys: "knowledge_base" (str, JSON-encoded — same
     shape/contract as before) and "session_title" (str).
     """
-    describe_str = df.describe(include="all").to_string()
+    # Keep the prompt bounded: full row count goes in the schema block, while the
+    # descriptive stats come from at most 2000 rows / 40 columns.
+    stats_frame = df.iloc[:2000, :40] if len(df) > 2000 or df.shape[1] > 40 else df
+    describe_str = stats_frame.describe(include="all").to_string()
     sample_str = df.head(5).to_string(index=False)
     cols = list(df.columns)
 
@@ -161,7 +245,7 @@ def build_knowledge_base(
 SCHEMA METADATA:
 {metadata}
 
-STATISTICAL SUMMARY:
+STATISTICAL SUMMARY (sampled; SCHEMA METADATA has full-data ranges):
 {describe_str}
 
 SAMPLE ROWS (first 5):
@@ -184,15 +268,26 @@ Return exactly this JSON structure (fill in values, keep all keys):
   "session_title": "a short (3-6 word) human-friendly title for a new analysis session on this dataset, e.g. 'Q3 Sales Analysis' or 'Customer Churn Data'"
 }}"""
     chars = len(system) + len(user)
-    print(f"---AI Called for Build_Knowledge_Base (+session_title): {chars} characters or {chars/4} tokens roughly")
+    logger.info(
+        "Calling AI for knowledge base + session title (%s chars ≈ %s tokens)",
+        chars, chars // 4,
+    )
 
-    raw = llm_client.ask_llm(system, user)
+    try:
+        raw = llm_client.ask_llm(system, user)
+        kb_dict = json_utils.extract_json_object(raw)
+        if not isinstance(kb_dict, dict):
+            raise ValueError("Knowledge base response was not a JSON object.")
+    except Exception:
+        logger.exception("Knowledge base generation failed for %s; using deterministic fallback", table_name)
+        return _fallback_knowledge_base(df, metadata, table_name, roles)
 
-    kb_dict = json_utils.extract_json_object(raw)
-    session_title = kb_dict.pop("session_title", None) or f"Analysis of {table_name}"
-    kb_dict["column_roles"] = json.loads(roles)
+    session_title = kb_dict.pop("session_title", None)
+    if not isinstance(session_title, str) or not session_title.strip():
+        session_title = _default_session_title(table_name)
+    kb_dict = _sanitize_kb(kb_dict, df, metadata, table_name, roles)
 
-    return {"knowledge_base": json.dumps(kb_dict), "session_title": session_title}
+    return {"knowledge_base": json.dumps(kb_dict), "session_title": session_title.strip()[:120]}
 
 
 def basic_transform(df: pd.DataFrame) -> pd.DataFrame:
@@ -213,13 +308,13 @@ def basic_transform(df: pd.DataFrame) -> pd.DataFrame:
 
     before = len(df)
     df.drop_duplicates(inplace=True)
-    print(f"Duplicates removed: {before - len(df)}")
+    logger.info("Basic transform: %s duplicate rows removed", before - len(df))
 
     null_pct = df.isnull().mean()
     drop_cols = null_pct[null_pct > 0.8].index.tolist()
     if drop_cols:
         df.drop(columns=drop_cols, inplace=True)
-    print(f"High-null columns dropped: {drop_cols or 'none'}")
+    logger.info("Basic transform: high-null columns dropped: %s", drop_cols or "none")
 
     num_cols = df.select_dtypes(include="number").columns.tolist()
     filled_num = []
@@ -229,7 +324,7 @@ def basic_transform(df: pd.DataFrame) -> pd.DataFrame:
             if pd.notnull(median_val):
                 df[col] = df[col].fillna(median_val)
             filled_num.append(col)
-    print(f"Numeric nulls filled: {filled_num or 'none'}")
+    logger.info("Basic transform: numeric nulls filled: %s", filled_num or "none")
 
     try:
         cat_cols = df.select_dtypes(include=["string", "category"]).columns.tolist()
@@ -241,19 +336,37 @@ def basic_transform(df: pd.DataFrame) -> pd.DataFrame:
         if df[col].isnull().sum() > 0:
             df[col] = df[col].fillna("Unknown")
             filled_cat.append(col)
-    print(f"Categorical nulls filled: {filled_cat or 'none'}")
+    logger.info("Basic transform: categorical nulls filled: %s", filled_cat or "none")
 
     return df
 
 
 def sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Shared column-name sanitization used at upload time, before any
-    other processing."""
+    other processing.
+
+    Beyond stripping punctuation (SQL identifiers), this guarantees every
+    header is non-empty, unique (pandas de-duplicates differently per
+    format), and within SQL Server's 128-character identifier limit — a
+    duplicate or empty header used to make CREATE TABLE fail mid-upload.
+    """
     df = df.copy()
-    df.columns = (
-        df.columns
+    cleaned = (
+        df.columns.astype(str)
         .str.strip()
         .str.replace(r"[^A-Za-z0-9]+", "_", regex=True)
         .str.strip("_")
     )
+    seen: set[str] = set()
+    names: list[str] = []
+    for i, col in enumerate(cleaned):
+        base = (col or f"column_{i + 1}")[:120]
+        name = base
+        suffix = 1
+        while name in seen:
+            name = f"{base[:116]}_{suffix}"
+            suffix += 1
+        seen.add(name)
+        names.append(name)
+    df.columns = names
     return df

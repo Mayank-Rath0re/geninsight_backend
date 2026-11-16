@@ -12,12 +12,121 @@ to the original two-call plan-then-generate flow. Cost savings elsewhere
 """
 
 import json
+import logging
 import re
 
 from core import json_utils
 from services import llm_client
 
 from core.sql_safety import sanitize_sql as sanitize_llm_sql
+
+logger = logging.getLogger("my_global_app_logger")
+
+MAX_PROMPT_VALUES = 40   # low-cardinality columns: full value list (the useful mapping)
+MAX_PROMPT_SAMPLES = 8   # high-cardinality columns: a few representative values
+
+
+def _parse_json_object(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _column_value_hint(info: dict) -> str:
+    """Exact values the LLM must match filters against. 'all_possible_values' is
+    present for low-cardinality columns (the case that matters for mapping a fuzzy
+    request like 'high category' onto a real value such as 'High Cap')."""
+    allowed = info.get("all_possible_values")
+    if isinstance(allowed, list) and allowed:
+        shown = [json.dumps(str(v)) for v in allowed[:MAX_PROMPT_VALUES]]
+        extra = len(allowed) - len(shown)
+        text = "allowed values: " + ", ".join(shown)
+        if extra > 0:
+            text += f" (+{extra} more)"
+        return text
+    samples = info.get("sample_values")
+    if isinstance(samples, list) and samples:
+        shown = [json.dumps(str(v)) for v in samples[:MAX_PROMPT_SAMPLES]]
+        return "sample values: " + ", ".join(shown)
+    return ""
+
+
+def _table_schema_block(table_info: dict) -> str:
+    """Compact, LLM-readable schema for one table: dtype, uniqueness/null stats,
+    numeric range and — critically — the exact stored values per column, so the
+    planner maps user wording to real data instead of inventing categories."""
+    name = table_info.get("name") or "unknown"
+    kb = _parse_json_object(table_info.get("knowledgebase"))
+    meta = _parse_json_object(table_info.get("metadata"))
+
+    kb_columns = kb.get("columns_name") if isinstance(kb.get("columns_name"), list) else []
+    columns = [c for c in kb_columns if c in meta] or list(meta) or list(kb_columns)
+
+    row_count = kb.get("row_count")
+    col_count = kb.get("column_count") or len(columns) or None
+    header = f"Table [{name}]"
+    if row_count is not None:
+        header += f"  ({row_count} rows × {col_count} columns)" if col_count else f"  ({row_count} rows)"
+
+    lines = [header]
+    description = kb.get("description")
+    if isinstance(description, str) and description.strip():
+        lines.append(f"  context: {' '.join(description.split())[:400]}")
+    lines.append("  columns:")
+
+    for col in columns:
+        info = meta.get(col) or {}
+        parts = [f"type={info.get('dtype', 'unknown')}"]
+        if info.get("unique_count") is not None:
+            parts.append(f"unique={info['unique_count']}")
+        if info.get("null_pct"):
+            parts.append(f"nulls={info['null_pct']}%")
+        if "min" in info and "max" in info:
+            parts.append(f"range: {info['min']} to {info['max']}")
+        value_hint = _column_value_hint(info)
+        if value_hint:
+            parts.append(value_hint)
+        lines.append(f"    - [{col}]: " + " | ".join(parts))
+
+    roles = kb.get("column_roles")
+    if not isinstance(roles, dict):
+        roles = {}
+    if not roles:
+        # Older KBs stored role dicts at the top level instead of under column_roles.
+        roles = {k: v for k, v in kb.items() if isinstance(v, dict) and "role" in v}
+    if roles:
+        lines.append("  column roles:")
+        for col, info in roles.items():
+            if col not in columns or not isinstance(info, dict):
+                continue
+            advice = " ".join(str(info.get("advice", "")).split())[:220]
+            lines.append(f"    - [{col}]: role={info.get('role', 'unknown')} | {advice}")
+    return "\n".join(lines)
+
+
+VALUE_GROUNDING_RULES = """\
+VALUE GROUNDING (CRITICAL — filters must match the stored data exactly):
+- The BASE TABLES schema lists each column's type, unique/null counts, numeric range, and
+  either its full allowed value list (low-cardinality columns) or sample values
+  (high-cardinality columns).
+- The user's wording is approximate. When a request names a category, segment, tier or label
+  (e.g. "only include high category"), map it to the exact stored value(s) that best match the
+  listed allowed/sample values — for example, if a category column contains "High Cap",
+  "Mid Cap", "Small Cap", then "high category" means "High Cap".
+- Record every such mapping in "value_mappings" with the exact stored spelling, and write the
+  same exact value(s) into filter_logic. Never translate the user's wording into a category
+  value that does not appear in the data.
+- If no listed value matches, either use a numeric threshold grounded in the listed min/max
+  (and say so explicitly in filter_logic), or set "feasible": false. Never invent values.
+- Respect dtype: quote text literals; compare numeric columns to numbers; if a column is
+  stored as text but the request is numeric (or vice versa), note the CAST needed in "warning".
+"""
 
 ORDER_BY_RULES = """\
 ORDER BY RULES (CRITICAL — every query you write is later embedded as a CTE / derived table
@@ -50,18 +159,9 @@ def query_generation_instructions(
     prev_cols = table_cols.get("prev_cols")
 
     def build_tables_block():
-        blocks = []
-        for t in tables_info:
-            kb = json.loads(t["knowledgebase"])
-            col_roles = {k: v for k, v in kb.items() if isinstance(v, dict) and "role" in v}
-            cols = kb.get("columns_name", [])
-            lines = [f"Table [{t['name']}]:", f"  columns: {cols}", "  column roles:"]
-            for col, info in col_roles.items():
-                lines.append(f"    - [{col}]: role={info['role']} | {info['advice']}")
-            blocks.append("\n".join(lines))
-        return "\n\n".join(blocks)
+        return "\n\n".join(_table_schema_block(t) for t in tables_info)
 
-    sys_prompt = """You are a query-planning assistant for a SQL Server pipeline. You do NOT write SQL.
+    sys_prompt = f"""You are a query-planning assistant for a SQL Server pipeline. You do NOT write SQL.
 Your only job is to produce a structured JSON plan that a downstream generator will translate into SQL.
 
 Think carefully about correctness and safety BEFORE the query is written:
@@ -120,6 +220,8 @@ CRITICAL — never produce a GROUP BY with no aggregation:
   sub-select; if you must pre-sort inside a sub-select, it needs a TOP/OFFSET and a reason.
   Add an "order_by_in_cte" entry to risk_checks whenever sort_logic is non-empty.
 
+{VALUE_GROUNDING_RULES}
+
 Respond with ONLY a single raw JSON object — no markdown fences, no preamble, no trailing text.
 The response must be directly parseable by json.loads().
 """
@@ -171,7 +273,12 @@ Return exactly this JSON structure (fill in every key; use empty list/string/nul
         "fanout_risk": "none|possible - explanation"}}
     ]
   }},
-  "filter_logic": "plain-English description of WHERE conditions, or empty string",
+  "filter_logic": "plain-English description of WHERE conditions, using the exact stored values, or empty string",
+  "value_mappings": [
+    {{"column": "column the user referred to", "user_phrase": "wording from the request, e.g. 'high category'",
+      "matched_values": ["exact stored value(s), e.g. 'High Cap'"],
+      "match_type": "exact|like|range", "note": "why this mapping is correct, or empty string"}}
+  ],
   "aggregate_logic": "plain-English description of aggregate functions and their targets, or empty string",
   "group_logic": ["columns required in GROUP BY given the select/aggregate plan"],
   "sort_logic": "plain-English description of ORDER BY, or empty string",
@@ -185,12 +292,12 @@ Return exactly this JSON structure (fill in every key; use empty list/string/nul
 }}"""
 
     chars = len(sys_prompt) + len(user_prompt_full)
-    print(f"--- QUERY PLANNING CALLED: {chars} characters or {chars/4} tokens roughly")
+    logger.info("Query planning call (%s chars ≈ %s tokens)", chars, chars // 4)
 
     raw = llm_client.ask_llm(sys_prompt, user_prompt_full)
     plan = json_utils.extract_json_object(raw)
 
-    print("-- Query Plan Generated: ", json.dumps(plan, indent=2))
+    logger.debug("Query plan: %s", json.dumps(plan))
     return plan
 
 
@@ -247,25 +354,37 @@ part of, and it is not about CTE structure (CTE chaining across pipeline
 steps happens outside this query and is not your concern here):
 {plan.get("optimization") or "none"}
 
+━━━ VALUE MAPPINGS TO APPLY ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The user's wording has already been mapped to exact stored values. Implement
+each mapping verbatim in the WHERE clause (exact spelling and casing; prefer
+`IN (...)` when several values are listed):
+{json.dumps(plan.get("value_mappings") or [], indent=2)}
+
 {ORDER_BY_RULES}
 
 ━━━ HARD RULES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. Only SELECT. Never DROP, DELETE, TRUNCATE, ALTER, UPDATE, INSERT, CREATE, GRANT.
 2. Only reference columns that exist in the current schema (previous step's columns for 'middle', base table columns for first/only).
-3. String literals (values, in WHERE/comparisons) use single quotes.
+3. Category/value filters MUST use the exact stored value spellings shown in the
+   table schema (allowed values / sample values) or in plan.value_mappings.
+   Never invent, translate, paraphrase or title-case a category value: if the
+   user says "high category" and the stored value is "High Cap", the WHERE clause
+   must contain 'High Cap'. Prefer exact comparisons / IN (...) over LIKE; use
+   LIKE only when no exact value matches.
+4. String literals (values, in WHERE/comparisons) use single quotes.
    Column ALIASES that contain spaces or special characters MUST use
    bracket-delimited identifiers — e.g. AS [Market Cap to Sales Ratio] —
    NEVER single quotes for an alias (SQL Server treats 'text' as a string
    literal, not an identifier, and the query will not mean what you intend).
    Aliases with no spaces/special characters do not need brackets.
-4. Multi-table queries must use table aliases.
-5. No trailing semicolon.
-6. Every non-aggregated SELECT column must appear in GROUP BY if any aggregate is used.
-7. Do not invent columns not present in the plan's tables_needed schemas.
-8. The "columns" field you return MUST exactly match plan.column_plan.select_columns,
+5. Multi-table queries must use table aliases.
+6. No trailing semicolon.
+7. Every non-aggregated SELECT column must appear in GROUP BY if any aggregate is used.
+8. Do not invent columns not present in the plan's tables_needed schemas.
+9. The "columns" field you return MUST exactly match plan.column_plan.select_columns,
    in the same order — this is the single source of truth for the output schema,
    and it is checked programmatically after you respond.
-9. Summary should be 10 words at maximum with 4-6 preferred.
+10. Summary should be 10 words at maximum with 4-6 preferred.
 
 ━━━ OUTPUT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Return only a raw JSON object — no markdown, no fences:
@@ -277,11 +396,10 @@ Return only a raw JSON object — no markdown, no fences:
 """
 
     def table_string(table_info: dict):
-        return f"""\n
-        Table Name: {table_info["name"]}
-            metadata: {table_info["metadata"]}
-            knowledge_base: {table_info["knowledgebase"]}\n
-"""
+        return (
+            f"\n{_table_schema_block(table_info)}\n"
+            f"  knowledge_base: {table_info.get('knowledgebase') or '{}'}\n"
+        )
 
     sql_user_prompt = "PLAN TO IMPLEMENT:\n" + json.dumps(plan, indent=2)
 
@@ -294,7 +412,7 @@ Previous Query Info:
     Latest Columns (Post Query Execution): {previous_query_data["updated_columns"]}
 """
 
-    sql_user_prompt += "\nTables Info:\n"
+    sql_user_prompt += "\nBASE TABLES (schema, exact stored values, and context):\n"
     for table in tables_info:
         sql_user_prompt += table_string(table)
 
@@ -304,10 +422,10 @@ REMINDER: Always use the real table name in FROM. SELECT only the plan's select_
 """
 
     characters = len(sql_user_prompt) + len(sys_prompt)
-    print(f"--- SQL QUERY GENERATION CALLED: {characters} characters or {characters/4} tokens roughly")
+    logger.info("SQL generation call (%s chars ≈ %s tokens)", characters, characters // 4)
 
     raw = llm_client.ask_llm(sys_prompt, sql_user_prompt)
-    print("-- SQL Query Generated: ", raw)
+    logger.debug("Generated SQL response: %s", raw)
     result = json_utils.extract_json_object(raw)
 
     sql = sanitize_llm_sql(result["sql"])
@@ -316,10 +434,9 @@ REMINDER: Always use the real table name in FROM. SELECT only the plan's select_
     reported_cols = result["columns"]
 
     if set(reported_cols) != set(planned_cols):
-        print(
-            f"-- WARNING: generated SQL columns {reported_cols} do not match "
-            f"planned columns {planned_cols}. Using planned columns for pipeline "
-            f"schema tracking; SQL itself is left as generated (not rewritten)."
+        logger.warning(
+            "Generated SQL columns %s do not match planned columns %s; using planned columns "
+            "for pipeline schema tracking", reported_cols, planned_cols,
         )
         columns_out = planned_cols
     else:
@@ -339,6 +456,10 @@ def repair_sql(user_prompt: str, bad_sql: str, error_message: str,
       Return ONLY raw JSON: {{"sql": "...", "summary": "<=10 words"}}.
       Keep the output columns exactly: {json.dumps(expected_columns)}.
       Only SELECT. No trailing semicolon. Use [brackets] for aliases with spaces. Reference only columns that exist.
+      Category/value literals must use the exact stored spellings shown in the table schema
+      (allowed values / sample values) — never invent or paraphrase a value; when the user's
+      request names a segment approximately (e.g. "high"), use the matching stored value
+      (e.g. 'High Cap'). Don't change a value literal unless the error proves it doesn't exist.
 
       {ORDER_BY_RULES}"""
     user = f"""USER REQUEST: {user_prompt}
@@ -351,8 +472,7 @@ def repair_sql(user_prompt: str, bad_sql: str, error_message: str,
 
       TABLES:
       """ + "\n".join(
-        f"Table {t['name']}\n metadata: {t['metadata']}\n knowledge_base: {t['knowledgebase']}"
-        for t in tables_info
+        _table_schema_block(t) for t in tables_info
     )
     if previous_query_data:
         user += f"\nColumns before this step: {previous_query_data['updated_columns']}"

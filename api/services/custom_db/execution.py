@@ -90,6 +90,12 @@ def session_data_source_id(session_id: int) -> int | None:
 def _internal_fetch(sql: str, limit, offset: int) -> dict:
     # Unchanged behaviour: our own SQL Server runs the query as-is (dashboard and
     # preview SQL already carry their own TOP bound), then rows are sliced here.
+    # The safety check is repeated here as a last line of defence because stored
+    # LLM-generated SQL is replayed from the database.
+    ok, why = is_safe_select(sql)
+    if not ok:
+        raise ValueError(f"Unsafe SQL rejected: {why}")
+
     result = db.fetch_with_columns(sql)
     rows = result["rows"]
     if offset:

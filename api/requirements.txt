@@ -19,3 +19,4 @@ pymysql>=1.1
 psycopg2-binary>=2.9
 sqlglot>=25.0
 cryptography>=42.0
+reportlab>=4.0

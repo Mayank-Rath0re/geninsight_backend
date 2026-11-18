@@ -42,8 +42,31 @@ _WRITE_DIALECT = {"mysql": "mysql", "postgres": "postgres"}
 # appends `OFFSET 0 ROWS`. MySQL/Postgres reject OFFSET without LIMIT (and 0 rows
 # is a no-op anyway) — drop it, but never when a FETCH follows (that is a real
 # top-N: `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY`).
-_NOOP_OFFSET_ZERO = re.compile(r"\bOFFSET\s+0\s+ROWS?(?!\s+FETCH\b)", re.I)
+_NOOP_OFFSET_ZERO = re.compile(r"\bOFFSET\s+0\s+ROWS?\b(?!\s+FETCH\b)", re.I)
 _TRAILING_OFFSET_ZERO = re.compile(r"\bOFFSET\s+0\s+ROWS?\s*$", re.I)
+
+# Drive placeholders (%s) are not SQL tokens, so sqlglot cannot parse queries
+# that carry them. Swap each one for a recognisable string literal, transpile,
+# then put the placeholder back.
+_PARAM_MARKER_PREFIX = "__amoeba_param_"
+
+
+def _mask_params(sql: str) -> tuple[str, int]:
+    count = 0
+
+    def repl(_match):
+        nonlocal count
+        marker = f"'{_PARAM_MARKER_PREFIX}{count}__'"
+        count += 1
+        return marker
+
+    return re.sub(r"%s", repl, sql), count
+
+
+def _restore_params(sql: str, count: int) -> str:
+    for index in range(count):
+        sql = sql.replace(f"'{_PARAM_MARKER_PREFIX}{index}__'", "%s")
+    return sql
 
 
 def normalize_db_type(value: str) -> str:
@@ -89,6 +112,8 @@ def to_native_sql(sql: str, db_type: str) -> str:
     if db_type in ("mysql", "postgres"):
         source_sql = _NOOP_OFFSET_ZERO.sub("", source_sql)
 
+    source_sql, param_count = _mask_params(source_sql)
+
     try:
         translated = sqlglot.transpile(
             source_sql,
@@ -101,7 +126,7 @@ def to_native_sql(sql: str, db_type: str) -> str:
 
     if not translated:
         raise ValueError(f"Could not translate the query for {db_type}.")
-    return translated[0]
+    return _restore_params(translated[0], param_count)
 
 
 def apply_row_limit(sql: str, db_type: str, limit=None, offset: int = 0) -> str:

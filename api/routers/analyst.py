@@ -427,6 +427,8 @@ class AnalystPdfRequest(BaseModel):
     kpis: List[Dict[str, Any]] = []
     steps: List[Dict[str, Any]] = []
     data: Dict[str, Any] = {}
+    # Step id -> "data:image/png;base64,..." captured from the live charts.
+    chart_images: Dict[str, str] = {}
 
 
 def _safe_filename(title: str) -> str:
@@ -448,6 +450,10 @@ def export_analyst_pdf(payload: AnalystPdfRequest, authed_user_id: int = Depends
     )
     if total_rows > 500:
         raise HTTPException(status_code=413, detail="Report is too large to export.")
+    if len(payload.chart_images) > 10:
+        raise HTTPException(status_code=422, detail="Too many chart images.")
+    if sum(len(v or "") for v in payload.chart_images.values()) > 12_000_000:
+        raise HTTPException(status_code=413, detail="Chart images are too large.")
 
     try:
         pdf = analyst_pdf.render_analysis_pdf(payload.model_dump())

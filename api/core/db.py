@@ -3,7 +3,6 @@
 Database access layer
 """
 
-import csv
 import logging
 from contextlib import contextmanager
 from typing import Any, List, Optional
@@ -168,55 +167,54 @@ def run(query: str, params: tuple = None) -> bool:
 # Schema helpers
 # ---------------------------------------------------------------------------
 
-def _python_type_to_sql_type(value) -> str:
-    if isinstance(value, bool):
+# SQL Server allows at most 2100 parameters per statement; stay well under it so
+# one multi-row INSERT never tips over the limit.
+INSERT_MAX_PARAMS = 2000
+
+
+def _series_sql_type(series) -> str:
+    """Map a pandas column directly to a SQL type, so the schema no longer needs
+    a second pass over the raw file."""
+    from pandas.api import types as ptypes
+
+    if ptypes.is_bool_dtype(series):
         return "BIT"
-    if isinstance(value, int):
+    if ptypes.is_integer_dtype(series):
         return "BIGINT"
-    if isinstance(value, float):
+    if ptypes.is_float_dtype(series):
         return "FLOAT"
-    if isinstance(value, str):
-        return "NVARCHAR(255)" if len(value) <= 255 else "NVARCHAR(MAX)"
-    return "NVARCHAR(MAX)"
+    if ptypes.is_datetime64_any_dtype(series):
+        return "DATETIME2"
+
+    non_null = series.dropna()
+    if non_null.empty:
+        return "NVARCHAR(255)"
+    max_len = int(non_null.astype(str).str.len().max() or 0)
+    return "NVARCHAR(MAX)" if max_len > 255 else "NVARCHAR(255)"
 
 
-def generate_sql_schema(table_name: str, file_path: str) -> str:
-    with open(file_path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-
-    if not rows:
+def generate_sql_schema(table_name: str, dataframe) -> str:
+    columns = list(dataframe.columns)
+    if dataframe.empty or not columns:
         return (
             f"IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{table_name}' AND xtype='U') "
             f"CREATE TABLE [{table_name}] ([id] INT IDENTITY(1,1) PRIMARY KEY);"
         )
 
-    columns = list(rows[0].keys())
-    col_defs: List[str] = []
-
     pk_col = ""
     for col in columns:
-        if col.lower() in ("id",) or col.lower().endswith("_id"):
-            values = [r[col] for r in rows if r[col] != ""]
-            if len(values) == len(rows) and len(set(values)) == len(rows):
+        if col.lower() == "id" or col.lower().endswith("_id"):
+            series = dataframe[col]
+            if series.notna().all() and series.is_unique:
                 pk_col = col
                 break
 
+    col_defs: List[str] = []
     if not pk_col:
         col_defs.append("[id] INT IDENTITY(1,1) PRIMARY KEY")
 
     for col in columns:
-        samples = [r[col] for r in rows if r[col] != ""]
-        sample = samples[0] if samples else ""
-        try:
-            int(sample)
-            sql_type = "BIGINT"
-        except ValueError:
-            try:
-                float(sample)
-                sql_type = "FLOAT"
-            except ValueError:
-                sql_type = _python_type_to_sql_type(sample)
-
+        sql_type = _series_sql_type(dataframe[col])
         col_defs.append(
             f"[{col}] {sql_type} PRIMARY KEY" if col == pk_col else f"[{col}] {sql_type}"
         )
@@ -226,3 +224,27 @@ def generate_sql_schema(table_name: str, file_path: str) -> str:
         f"IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{table_name}' AND xtype='U')\n"
         f"CREATE TABLE [{table_name}] (\n  {defs_str}\n);"
     )
+
+
+def max_rows_per_insert(column_count: int) -> int:
+    """Rows that fit in one multi-row VALUES clause for the given column count."""
+    return max(1, min(1000, INSERT_MAX_PARAMS // max(1, column_count)))
+
+
+def insert_rows(cursor, table_name: str, columns: List[str], rows: list) -> int:
+    """Insert `rows` (list of tuples, already matching `columns`) as one
+    multi-row INSERT. Callers batch with max_rows_per_insert(); a per-row
+    INSERT is one network round trip each, which is what made large uploads
+    take minutes."""
+    if not rows:
+        return 0
+
+    col_list = ", ".join(f"[{c}]" for c in columns)
+    row_placeholder = "(" + ", ".join(["%s"] * len(columns)) + ")"
+    values = ", ".join([row_placeholder] * len(rows))
+    params = tuple(value for row in rows for value in row)
+    cursor.execute(
+        f"INSERT INTO [{table_name}] ({col_list}) VALUES {values}",
+        params,
+    )
+    return len(rows)

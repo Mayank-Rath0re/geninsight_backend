@@ -7,7 +7,10 @@ rows); this module only lays it out. No AI call and no database access happen
 here, so exporting is fast and cannot fail because of an LLM outage.
 """
 
+import base64
+import binascii
 import logging
+import struct
 from datetime import datetime, timezone
 from io import BytesIO
 from xml.sax.saxutils import escape
@@ -16,13 +19,8 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
-from reportlab.graphics.charts.barcharts import HorizontalBarChart, VerticalBarChart
-from reportlab.graphics.charts.linecharts import HorizontalLineChart
-from reportlab.graphics.charts.lineplots import ScatterPlot
-from reportlab.graphics.charts.piecharts import Pie
-from reportlab.graphics.shapes import Drawing
-from reportlab.graphics.widgets.markers import makeMarker
 from reportlab.platypus import (
+    Image,
     KeepTogether,
     Paragraph,
     SimpleDocTemplate,
@@ -37,7 +35,7 @@ logger = logging.getLogger("my_global_app_logger")
 
 MAX_PDF_ROWS = 12
 MAX_PDF_COLUMNS = 8
-MAX_CHART_POINTS = 10
+MAX_CHART_BYTES = 2 * 1024 * 1024
 
 INK = colors.HexColor("#1F1D1A")
 MUTED = colors.HexColor("#6B655D")
@@ -46,17 +44,7 @@ RULE = colors.HexColor("#DCD6CC")
 SOFT = colors.HexColor("#F5F2EC")
 
 CHART_WIDTH = 168 * mm
-CHART_HEIGHT = 64 * mm
-CHART_FILLS = [
-    colors.HexColor("#6E4FC0"),
-    colors.HexColor("#9C86D6"),
-    colors.HexColor("#C4B6E8"),
-    colors.HexColor("#8A7FB5"),
-    colors.HexColor("#B0A6C9"),
-    colors.HexColor("#5A4396"),
-    colors.HexColor("#D9D2EA"),
-    colors.HexColor("#7B6FA8"),
-]
+CHART_MAX_HEIGHT = 95 * mm
 
 
 def _text(value) -> str:
@@ -154,161 +142,50 @@ def _result_table(columns: list, rows: list, style) -> Table:
     return table
 
 
-def _gtext(value) -> str:
-    raw = "" if value is None else str(value)
-    return raw.encode("latin-1", "replace").decode("latin-1")
-
-
-def _axis_label(value) -> str:
-    return _gtext(_fmt_number(value))[:12]
-
-
-def _to_float(value):
-    if isinstance(value, bool):
+def _decode_png(data_url) -> tuple[bytes, int, int] | None:
+    """Validate a chart data URL and pull its PNG bytes plus pixel size."""
+    if not isinstance(data_url, str) or not data_url.strip():
         return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-    else:
-        try:
-            number = float(str(value).replace(",", "").strip())
-        except (TypeError, ValueError):
-            return None
-    if number != number or number in (float("inf"), float("-inf")):
-        return None
-    return number
-
-
-def _chart_series(step: dict, result: dict):
-    """Pull (labels, values, raw_x) out of a step's result rows."""
-    columns = [str(c) for c in (result.get("columns") or [])]
-    rows = result.get("rows") or []
-    if not columns or not rows:
-        return [], [], []
-
-    lower = {c.lower(): i for i, c in enumerate(columns)}
-    x_idx = lower.get(str(step.get("x_column") or "").lower(), 0)
-    y_idx = lower.get(str(step.get("y_column") or "").lower(), len(columns) - 1)
-    if x_idx == y_idx and len(columns) > 1:
-        y_idx = 0 if x_idx != 0 else 1
-
-    labels, values, raw_x = [], [], []
-    for row in rows[:MAX_CHART_POINTS]:
-        if not isinstance(row, (list, tuple)):
-            continue
-        cell_x = row[x_idx] if x_idx < len(row) else ""
-        number = _to_float(row[y_idx] if y_idx < len(row) else None)
-        if number is None:
-            continue
-        labels.append(_gtext(cell_x)[:18])
-        values.append(number)
-        raw_x.append(_to_float(cell_x))
-    return labels, values, raw_x
-
-
-def _style_axis(axis, size=6.5) -> None:
-    axis.labels.fontName = "Helvetica"
-    axis.labels.fontSize = size
-    axis.strokeColor = RULE
-    axis.gridStrokeColor = RULE
-    axis.gridStrokeWidth = 0.3
-    axis.visibleGrid = 1
-    axis.visibleTicks = 0
-
-
-def _bar_chart(drawing, labels, values, horizontal: bool) -> None:
-    chart = HorizontalBarChart() if horizontal else VerticalBarChart()
-    if horizontal:
-        chart.x, chart.y, chart.width, chart.height = 96, 12, 356, 148
-    else:
-        chart.x, chart.y, chart.width, chart.height = 34, 20, 424, 136
-    chart.data = [values]
-    chart.categoryAxis.categoryNames = labels
-    _style_axis(chart.categoryAxis)
-    _style_axis(chart.valueAxis)
-    chart.valueAxis.labelTextFormat = _axis_label
-    chart.valueAxis.visibleGrid = 1
-    chart.categoryAxis.strokeColor = RULE
-    chart.bars[0].fillColor = ACCENT
-    chart.bars[0].strokeColor = None
-    drawing.add(chart)
-
-
-def _line_chart(drawing, labels, values) -> None:
-    chart = HorizontalLineChart()
-    chart.x, chart.y, chart.width, chart.height = 34, 24, 424, 128
-    chart.data = [values]
-    chart.categoryAxis.categoryNames = labels
-    _style_axis(chart.categoryAxis)
-    _style_axis(chart.valueAxis)
-    chart.valueAxis.labelTextFormat = _axis_label
-    chart.lines[0].strokeColor = ACCENT
-    chart.lines[0].strokeWidth = 1.6
-    chart.lines[0].fillColor = None
-    drawing.add(chart)
-
-
-def _scatter_chart(drawing, raw_x, values) -> None:
-    points = []
-    for index, value in enumerate(values):
-        x_value = raw_x[index] if index < len(raw_x) else None
-        points.append((float(index + 1) if x_value is None else x_value, value))
-    chart = ScatterPlot()
-    chart.x, chart.y, chart.width, chart.height = 40, 24, 410, 128
-    chart.data = [points]
-    _style_axis(chart.xValueAxis)
-    _style_axis(chart.yValueAxis)
-    chart.yValueAxis.labelTextFormat = _axis_label
-    chart.xValueAxis.labelTextFormat = _axis_label
-    chart.lines[0].strokeWidth = 0
-    chart.lines[0].symbol = makeMarker("FilledCircle")
-    chart.lines[0].symbol.fillColor = ACCENT
-    chart.lines[0].symbol.strokeColor = ACCENT
-    drawing.add(chart)
-
-
-def _pie_chart(drawing, labels, values) -> bool:
-    pairs = [(label, value) for label, value in zip(labels, values) if value > 0]
-    if len(pairs) < 2:
-        return False
-    pairs = pairs[:8]
-    chart = Pie()
-    chart.x, chart.y, chart.width, chart.height = 142, 6, 192, 156
-    chart.data = [value for _, value in pairs]
-    chart.labels = [label for label, _ in pairs]
-    chart.slices.fontName = "Helvetica"
-    chart.slices.fontSize = 6.5
-    chart.slices.strokeColor = colors.white
-    chart.slices.strokeWidth = 0.6
-    for i in range(len(pairs)):
-        chart.slices[i].fillColor = CHART_FILLS[i % len(CHART_FILLS)]
-        chart.slices[i].labelRadius = 1.04
-    chart.sideLabels = 1
-    drawing.add(chart)
-    return True
-
-
-def _chart_flowable(step: dict, result: dict):
-    """Best-effort chart for a step. A rendering failure never blocks the PDF."""
+    payload = data_url.strip()
+    if payload.startswith("data:"):
+        _, _, payload = payload.partition(",")
     try:
-        chart_type = str(step.get("chart_type") or "bar").lower()
-        labels, values, raw_x = _chart_series(step, result)
-        if len(values) < 2:
-            return None
-        drawing = Drawing(CHART_WIDTH, CHART_HEIGHT)
-        if chart_type == "pie":
-            if not _pie_chart(drawing, labels, values):
-                return None
-        elif chart_type == "line":
-            _line_chart(drawing, labels, values)
-        elif chart_type == "scatter":
-            _scatter_chart(drawing, raw_x, values)
-        elif chart_type == "column":
-            _bar_chart(drawing, labels, values, horizontal=False)
-        else:
-            _bar_chart(drawing, labels, values, horizontal=True)
-        return drawing
+        raw = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    # PNG signature + IHDR chunk (width/height at bytes 16..24).
+    if not raw.startswith(b"\x89PNG\r\n\x1a\n") or len(raw) < 33:
+        return None
+    if len(raw) > MAX_CHART_BYTES:
+        return None
+    width, height = struct.unpack(">II", raw[16:24])
+    if width <= 0 or height <= 0:
+        return None
+    return raw, width, height
+
+
+def _chart_flowable(step: dict, chart_images: dict):
+    """Embed the PNG the client captured for this step, if it sent one.
+
+    A missing or malformed image never blocks the PDF; the step still renders
+    its result table.
+    """
+    decoded = _decode_png(chart_images.get(step.get("id")))
+    if decoded is None:
+        return None
+    raw, width, height = decoded
+
+    draw_width = CHART_WIDTH
+    draw_height = draw_width * height / width
+    if draw_height > CHART_MAX_HEIGHT:
+        draw_height = CHART_MAX_HEIGHT
+        draw_width = draw_height * width / height
+    try:
+        return Image(BytesIO(raw), width=draw_width, height=draw_height)
     except Exception:
-        logger.warning("Skipping chart in PDF for step %s", step.get("id"), exc_info=True)
+        logger.warning(
+            "Skipping chart image in PDF for step %s", step.get("id"), exc_info=True
+        )
         return None
 
 
@@ -385,7 +262,7 @@ def render_analysis_pdf(payload: dict) -> bytes:
                 story.append(KeepTogether(head))
 
                 result = data.get(step.get("id")) or {}
-                chart = _chart_flowable(step, result)
+                chart = _chart_flowable(step, payload.get("chart_images") or {})
                 if chart is not None:
                     story.append(Spacer(1, 2))
                     story.append(chart)

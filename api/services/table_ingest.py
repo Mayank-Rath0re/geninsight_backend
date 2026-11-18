@@ -6,12 +6,15 @@ one previous duplication point between those two flows.
 Session creation now happens here too: every uploaded table gets its own
 brand-new session immediately, seeded with a single, purely mechanical
 "SELECT * FROM [table]" initial step (0 AI calls — the row count/columns
-for that step are read directly from the table, not generated). This
-replaces the old lazy "session is created on first /transform call" and
-"_bootstrapSessionForMerge" bootstrap pattern.
+for that step are read directly from the table, not generated).
+
+The file is parsed exactly once into a DataFrame. Metadata, the SQL
+schema and the rows written to the database all come from that frame —
+the old path re-read the CSV from disk four separate times and inserted
+one row per round trip, which is what made multi-hundred-thousand-row
+uploads take minutes.
 """
 
-import csv
 import json
 import logging
 import os
@@ -19,6 +22,7 @@ import re
 import uuid
 
 from fastapi import HTTPException, UploadFile, status
+from starlette.concurrency import run_in_threadpool
 
 from core import db
 from core.config import UPLOAD_DIR
@@ -28,22 +32,69 @@ logger = logging.getLogger("my_global_app_logger")
 
 MAX_TABLE_NAME_LEN = 120
 
+# Progress phases reported to the client while an upload is processed.
+PHASE_UPLOADING = "uploading"
+PHASE_CLEANING = "cleaning"
+PHASE_ANALYZING = "analyzing"
+PHASE_IMPORTING = "importing"
+PHASE_PREVIEW = "preview"
 
-def _cast(value: str, col: str, sample_rows: list) -> object:
-    if value == "" or value is None:
-        return None
-    sample = next((r[col] for r in sample_rows if r[col] != ""), "")
+# Overall percentage each phase starts at. The client shows the same phases,
+# so "uploading" (bytes in flight, measured client-side) covers 0-20%.
+_MILESTONE_CLEANING = 20
+_MILESTONE_ANALYZING = 34
+_MILESTONE_IMPORTING = 52
+_MILESTONE_PREVIEW = 92
+
+
+def _report(progress, phase: str, pct: int, message: str) -> None:
+    if progress is None:
+        return
     try:
-        int(sample)
-        return int(value)
-    except (ValueError, TypeError):
-        pass
+        progress(phase, pct, message)
+    except Exception:
+        # Progress reporting must never abort an upload.
+        logger.debug("Upload progress callback failed", exc_info=True)
+
+
+def _datetime_to_objects(df):
+    """pymssql wants datetime.datetime, not numpy datetime64/Timestamp."""
+    for col in df.columns:
+        if df[col].dtype.kind == "M":
+            df[col] = df[col].dt.to_pydatetime()
+    return df
+
+
+def _frame_rows(frame) -> list:
+    """Chunk -> list of tuples with NaN/NaT already converted to None."""
+    ready = frame.astype(object).where(frame.notna(), None)
+    return [tuple(row) for row in ready.values.tolist()]
+
+
+def _load_dataframe(file_path: str, filename: str):
     try:
-        float(sample)
-        return float(value)
-    except (ValueError, TypeError):
-        pass
-    return value
+        df = ingestion.get_dataframe(file_path)
+    except Exception:
+        logger.exception("Could not parse uploaded file %s", filename)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "INVALID_FILE", "message": "That file couldn't be read as a table. Check the format and try again.", "retryable": False},
+        )
+    if df is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "UNSUPPORTED_FILE", "message": "Only CSV and XLSX files are supported.", "retryable": False},
+        )
+    return df
+
+
+def _validate_filename(filename: str) -> None:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in ["csv", "xlsx"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid file format. Only csv and xlsx files are allowed.",
+        )
 
 
 def _unique_table_name(base: str) -> str:
@@ -65,56 +116,30 @@ def _table_name_for(user_id: int, filename: str) -> str:
     return _unique_table_name(f"user{user_id}_{safe_stem}")
 
 
-async def ingest_table_and_session(
+def ingest_table_and_session_from_path(
     user_id: int,
-    file: UploadFile,
+    file_path: str,
+    filename: str,
     apply_basic_transformation: bool = False,
+    progress=None,
 ) -> dict:
+    """Synchronous ingest core. Runs in a worker thread — it is deliberately not
+    async so the pandas/DB work never blocks the event loop.
+
+    `progress(phase, pct, message)` is optional; pct is overall 0-100.
     """
-    Ingests `file` into a new table_info row, then creates a brand-new
-    session rooted on that table with a single mechanical initial step
-    (SELECT * FROM [table], no AI call — the columns for this step are
-    just the table's own column list).
+    _report(progress, PHASE_CLEANING, _MILESTONE_CLEANING, "Reading the file")
 
-    Returns {"table_id", "table_name", "session_id", "session_title", "query_id"}.
-    """
-    # The client controls the filename: strip any directory component so a name
-    # like "../../x.csv" can never escape UPLOAD_DIR.
-    filename = os.path.basename((file.filename or "").replace("\\", "/"))
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext not in ["csv", "xlsx"]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid file format. Only csv and xlsx files are allowed.",
-        )
-
-    file_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}_{filename}")
-    table_name = _table_name_for(user_id, filename)
-
-    contents = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(contents)
-
-    try:
-        df = ingestion.get_dataframe(file_path)
-    except Exception:
-        logger.exception("Could not parse uploaded file %s", filename)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "INVALID_FILE", "message": "That file couldn't be read as a table. Check the format and try again.", "retryable": False},
-        )
-    if df is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "UNSUPPORTED_FILE", "message": "Only CSV and XLSX files are supported.", "retryable": False},
-        )
+    df = _load_dataframe(file_path, filename)
     df = ingestion.sanitize_columns(df)
     if df.empty:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "EMPTY_DATASET", "message": "That file has no data rows to analyze.", "retryable": False},
         )
+
     if apply_basic_transformation:
+        _report(progress, PHASE_CLEANING, 26, "Removing duplicates and filling gaps")
         df = ingestion.basic_transform(df)
     if df.shape[1] == 0:
         raise HTTPException(
@@ -125,17 +150,31 @@ async def ingest_table_and_session(
                 "retryable": False,
             },
         )
-    df.to_csv(file_path, index=False)
 
-    metadata = ingestion.extract_metadata(file_path)
-    roles = ingestion.classify_column_roles(df, metadata)
+    table_name = _table_name_for(user_id, filename)
     columns = list(df.columns)
+
+    _report(progress, PHASE_ANALYZING, _MILESTONE_ANALYZING, "Profiling columns")
+    metadata = ingestion.metadata_from_dataframe(df)
+    roles = ingestion.classify_column_roles(df, metadata)
+
+    # Derive the schema while datetime columns still carry their dtype.
+    schema = db.generate_sql_schema(table_name, df)
+
+    _report(progress, PHASE_ANALYZING, 44, "Describing the dataset with AI")
     # Full dataframe: the knowledge base's row_count/statistics must describe the
-    # whole dataset (it samples head(5) internally for the prompt).
+    # whole dataset (it sends exactly ingestion.SAMPLE_ROWS raw rows to the model).
     kb_result = ingestion.build_knowledge_base(df, metadata, table_name, roles)
     kb = kb_result["knowledge_base"]
     session_title = kb_result["session_title"]
-    del df
+
+    # Only now convert datetime64 -> datetime, so the stats block above keeps
+    # real dates; the driver needs plain datetime objects for the inserts.
+    _datetime_to_objects(df)
+
+    row_count = len(df)
+    inserted = 0
+    last_reported_pct = -1
 
     conn = db.get_connection()
     cursor = None
@@ -146,20 +185,25 @@ async def ingest_table_and_session(
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="User not found.")
 
-        schema = db.generate_sql_schema(table_name, file_path)
+        _report(progress, PHASE_IMPORTING, _MILESTONE_IMPORTING, "Creating the table")
         cursor.execute(schema)
 
-        with open(file_path, newline="", encoding="utf-8") as csvfile:
-            reader = csv.DictReader(csvfile)
-            rows = list(reader)
-            if rows:
-                cols = list(rows[0].keys())
-                col_list = ", ".join(f"[{c}]" for c in cols)
-                placeholders = ", ".join(["%s"] * len(cols))
-                insert_sql = f"INSERT INTO [{table_name}] ({col_list}) VALUES ({placeholders})"
-                for row in rows:
-                    typed_row = tuple(_cast(row[c], c, rows[:10]) for c in cols)
-                    cursor.execute(insert_sql, typed_row)
+        batch_size = db.max_rows_per_insert(len(columns))
+        for start in range(0, row_count, batch_size):
+            chunk = df.iloc[start:start + batch_size]
+            inserted += db.insert_rows(cursor, table_name, columns, _frame_rows(chunk))
+            if row_count:
+                pct = _MILESTONE_IMPORTING + int(
+                    (_MILESTONE_PREVIEW - 1 - _MILESTONE_IMPORTING) * inserted / row_count
+                )
+                if pct != last_reported_pct:
+                    last_reported_pct = pct
+                    _report(
+                        progress, PHASE_IMPORTING, pct,
+                        f"Writing {inserted:,} of {row_count:,} rows",
+                    )
+
+        _report(progress, PHASE_PREVIEW, _MILESTONE_PREVIEW, "Creating the preview")
 
         cursor.execute(
             "INSERT INTO table_info (name, user_id, knowledgebase, metadata, createdAt) "
@@ -203,6 +247,7 @@ async def ingest_table_and_session(
         new_query_id = row[0]
 
         conn.commit()
+        _report(progress, PHASE_PREVIEW, 100, "Ready")
     except HTTPException:
         conn.rollback()
         raise
@@ -221,4 +266,43 @@ async def ingest_table_and_session(
         "session_id": new_session_id,
         "session_title": session_title,
         "query_id": new_query_id,
+        "row_count": row_count,
     }
+
+
+def save_uploaded_bytes(contents: bytes, filename: str) -> str:
+    file_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}_{filename}")
+    with open(file_path, "wb") as f:
+        f.write(contents)
+    return file_path
+
+
+async def ingest_table_and_session(
+    user_id: int,
+    file: UploadFile,
+    apply_basic_transformation: bool = False,
+    progress=None,
+) -> dict:
+    """
+    Ingests `file` into a new table_info row, then creates a brand-new
+    session rooted on that table with a single mechanical initial step
+    (SELECT * FROM [table], no AI call — the columns for this step are
+    just the table's own column list).
+
+    Returns {"table_id", "table_name", "session_id", "session_title", "query_id"}.
+    """
+    # The client controls the filename: strip any directory component so a name
+    # like "../../x.csv" can never escape UPLOAD_DIR.
+    filename = os.path.basename((file.filename or "").replace("\\", "/"))
+    _validate_filename(filename)
+
+    contents = await file.read()
+    file_path = save_uploaded_bytes(contents, filename)
+    return await run_in_threadpool(
+        ingest_table_and_session_from_path,
+        user_id,
+        file_path,
+        filename,
+        apply_basic_transformation,
+        progress,
+    )

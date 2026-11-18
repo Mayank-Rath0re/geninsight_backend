@@ -16,7 +16,7 @@ from routers import (
     analyst, auth, billing, charts, dashboard, data_sources, datasets, export, merge,
     organizations, public, query, sessions, settings, transform,
 )
-from services import retention
+from services import referral_service, retention
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("my_global_app_logger")
@@ -36,8 +36,11 @@ async def lifespan(_: FastAPI):
                           id="retention_sweep", max_instances=1, coalesce=True)
         scheduler.add_job(retention.run_purge_sweep, "cron", hour=3, minute=0,
                           id="purge_sweep", max_instances=1, coalesce=True)
+        # Entitlement already ignores a lapsed voucher; this only tidies the rows.
+        scheduler.add_job(referral_service.run_expiry_sweep, "interval", minutes=30,
+                          id="referral_expiry", max_instances=1, coalesce=True)
         scheduler.start()
-        logger.info("Scheduler started (retention 02:30 UTC, purge 03:00 UTC)")
+        logger.info("Scheduler started (retention 02:30 UTC, purge 03:00 UTC, referral expiry every 30m)")
     try:
         yield
     finally:

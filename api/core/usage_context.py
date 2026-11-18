@@ -45,6 +45,23 @@ def reset_collector(token) -> None:
     _current.reset(token)
 
 
+# Plan code of the user whose request is being served. metered_call() sets this so
+# llm_client can pick the right model chain (paid -> Claude Haiku, free -> Gemma).
+_plan_code: ContextVar[Optional[str]] = ContextVar("usage_plan_code", default=None)
+
+
+def set_plan_code(code: Optional[str]):
+    return _plan_code.set(code)
+
+
+def reset_plan_code(token) -> None:
+    _plan_code.reset(token)
+
+
+def current_plan_code() -> Optional[str]:
+    return _plan_code.get()
+
+
 def record_llm_usage(input_tokens: int, output_tokens: int) -> None:
     """No-op when called outside a metered request (e.g. background jobs)."""
     c = _current.get()

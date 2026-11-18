@@ -31,25 +31,43 @@ except (ValueError, TypeError) as e:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# LLM providers
+# LLM providers (OpenRouter only)
 # ---------------------------------------------------------------------------
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL = "google/gemma-4-31b-it:standard"
 
 # Optional but recommended by OpenRouter for attribution/rankings
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
 OPENROUTER_SITE_NAME = os.getenv("OPENROUTER_SITE_NAME", "")
 
-# Fallback sequence for Groq models, ordered to avoid rate-limit locks
-GROQ_MODELS = [
-    "qwen/qwen3.8-27b",      # Primary (flagship reasoning)
-    "openai/gpt-oss-120b",   # Secondary (high TPM headroom)
+# Model routing by plan (see services/llm_client.py):
+#   free                        -> Gemma (open-source)
+#   individual / maxx / enterprise -> Claude Haiku (premium)
+# Within a chain the first success wins. `extra_body` is passed straight to OpenRouter.
+OPENROUTER_FREE_MODELS = [
+    {
+        "model": "google/gemma-4-31b-it:standard",
+        "extra_body": None,
+    },
 ]
-
-DEFAULT_LLM_PROVIDER = "openrouter"  # "groq" | "openrouter"
+OPENROUTER_PAID_MODELS = [
+    {
+        # Haiku 5.5 nitro: reasoning off, routed to the fastest provider.
+        "model": "anthropic/claude-haiku-5.5:nitro",
+        "extra_body": {
+            "reasoning": {"effort": "none"},
+            "provider": {"sort": "throughput"},
+        },
+    },
+    {
+        # Haiku 5.5 standard: reasoning off, default routing at standard rates.
+        "model": "anthropic/claude-haiku-5.5:standard",
+        "extra_body": {
+            "reasoning": {"effort": "none"},
+        },
+    },
+]
 
 # ---------------------------------------------------------------------------
 # Auth (JWT)

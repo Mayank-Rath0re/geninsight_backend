@@ -11,8 +11,16 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from core import context_propagation, db
-from core.usage_context import UsageCollector, record_llm_usage, set_collector, reset_collector
-from services import billing_service, razorpay_service, usage_service, retention
+from core.usage_context import (
+    UsageCollector,
+    current_plan_code,
+    record_llm_usage,
+    reset_collector,
+    reset_plan_code,
+    set_collector,
+    set_plan_code,
+)
+from services import billing_service, razorpay_service, referral_service, usage_service, retention
 from services.billing_service import Plan, Entitlement
 
 NOW = datetime(2026, 11, 3, 12, 0, 0)
@@ -87,6 +95,103 @@ def test_entitlement_picks_best_and_falls_back_to_free(monkeypatch):
     assert billing_service.get_entitlement(42).plan.code == "maxx"
     monkeypatch.setattr(db, "fetch", lambda q, p=None: [])
     assert billing_service.get_entitlement(42).plan.code == "free"
+
+
+def test_referral_ends_exactly_at_period_end_without_grace():
+    f = billing_service._is_entitled
+    assert f("active", NOW - timedelta(hours=1), False, NOW)                    # paid: renewal grace
+    assert not f("active", NOW - timedelta(hours=1), False, NOW, honor_grace=False)
+    assert f("active", NOW + timedelta(seconds=1), False, NOW, honor_grace=False)
+
+
+def test_referral_and_paid_outrank_test_grant(monkeypatch):
+    monkeypatch.setattr(billing_service, "utcnow", lambda: NOW)
+    plans = {1: FREE, 2: plan("individual"), 3: plan("maxx", id=3, price=49.99)}
+    monkeypatch.setattr(billing_service, "get_plan_by_id", lambda i: plans.get(i))
+    monkeypatch.setattr(billing_service, "get_plan_by_code", lambda c: FREE if c == "free" else None)
+    rows = [[10, 3, "active", 1, NOW + timedelta(days=9), 0, None, 42, 0, 1],    # testing Maxx
+            [11, 2, "active", 1, NOW + timedelta(days=9), 0, None, 42, 1, 0]]    # referral Individual
+    monkeypatch.setattr(db, "fetch", lambda q, p=None: rows)
+    assert billing_service.get_entitlement(42).plan.code == "individual"
+    rows[1][4] = NOW - timedelta(seconds=1)                                     # voucher lapsed
+    assert billing_service.get_entitlement(42).plan.code == "maxx"
+
+
+def _ref_code(**kw):
+    base = dict(id=5, code="AMOEBA100", plan_id=2, duration_days=30,
+                max_redemptions=100, redeemed_count=3, is_active=1,
+                valid_until=None, note="sample")
+    base.update(kw)
+    return [base["id"], base["code"], base["plan_id"], base["duration_days"],
+            base["max_redemptions"], base["redeemed_count"], base["is_active"],
+            base["valid_until"], base["note"]]
+
+
+def test_referral_preview_describes_trial_and_fallback(monkeypatch):
+    monkeypatch.setattr(referral_service, "utcnow", lambda: NOW)
+    monkeypatch.setattr(billing_service, "get_plan_by_id", lambda i: plan("individual"))
+    monkeypatch.setattr(billing_service, "get_plan_by_code", lambda c: FREE if c == "free" else None)
+    monkeypatch.setattr(billing_service, "get_entitlement", lambda uid: Entitlement(plan=FREE))
+    monkeypatch.setattr(db, "fetch",
+                        lambda q, p=None: [_ref_code()] if "referral_codes" in q else [])
+    out = referral_service.preview(42, " amoeba100 ")
+    assert out["plan"]["code"] == "individual"
+    assert out["duration_days"] == 30
+    assert out["remaining_redemptions"] == 97
+    assert out["fallback"]["plan"]["code"] == "free"
+
+
+@pytest.mark.parametrize("row,status,code", [
+    (_ref_code(is_active=0), 410, "REFERRAL_INACTIVE"),
+    (_ref_code(redeemed_count=100), 409, "REFERRAL_EXHAUSTED"),
+    (_ref_code(valid_until=NOW - timedelta(days=1)), 410, "REFERRAL_CODE_EXPIRED"),
+])
+def test_referral_preview_rejects_unusable_code(monkeypatch, row, status, code):
+    monkeypatch.setattr(referral_service, "utcnow", lambda: NOW)
+    monkeypatch.setattr(db, "fetch", lambda q, p=None: [row])
+    with pytest.raises(HTTPException) as err:
+        referral_service.preview(42, "X")
+    assert err.value.status_code == status and err.value.detail["code"] == code
+
+
+def test_referral_preview_unknown_code(monkeypatch):
+    monkeypatch.setattr(db, "fetch", lambda q, p=None: [])
+    with pytest.raises(HTTPException) as err:
+        referral_service.preview(42, "NOPE")
+    assert err.value.status_code == 404
+
+
+class ScriptedCursor:
+    def __init__(self, results):
+        self.results, self.calls, self.rowcount = list(results), [], 1
+
+    def execute(self, sql, params=()):
+        self.calls.append((sql, params))
+
+    def fetchone(self):
+        return self.results.pop(0) if self.results else None
+
+
+def test_redeem_creates_trial_and_retires_test_grant(monkeypatch):
+    monkeypatch.setattr(referral_service, "utcnow", lambda: NOW)
+    monkeypatch.setattr(billing_service, "get_plan_by_id", lambda i: plan("individual"))
+    monkeypatch.setattr(billing_service, "get_plan_by_code", lambda c: FREE if c == "free" else None)
+    monkeypatch.setattr(billing_service, "get_entitlement", lambda uid: Entitlement(plan=FREE))
+    monkeypatch.setattr(db, "fetch",
+                        lambda q, p=None: [] if "referral_redemptions" in q else [_ref_code()])
+    cur = ScriptedCursor([_ref_code(), None, [77], [88]])   # code, no prior redemption, sub id, redemption id
+    monkeypatch.setattr(db, "transaction", fake_tx(cur))
+
+    out = referral_service.redeem(42, "amoeba100")
+
+    assert out["redemption_id"] == 88 and out["plan"]["code"] == "individual"
+    assert out["expires_at"].startswith("2026-12-03")
+    sql = [s for s, _ in cur.calls]
+    assert any(s.startswith("UPDATE referral_codes SET redeemed_count") for s in sql)
+    assert any("is_test_grant = 1 AND status = 'active'" in s for s in sql)
+    insert_sub = next(p for s, p in cur.calls if s.startswith("INSERT INTO subscriptions"))
+    assert insert_sub[0] == 42 and insert_sub[1] == 2 and insert_sub[2].startswith("REFERRAL-")
+    assert insert_sub[4] == NOW + timedelta(days=30)
 
 
 # ───────────────────────── record_usage SQL values ─────────────────────────
@@ -185,24 +290,68 @@ def test_llm_client_reports_provider_usage_and_estimates_when_missing(monkeypatc
         assert (c.input_tokens, c.output_tokens) == expected
 
 
-def test_failed_groq_attempt_is_not_charged(monkeypatch):
+def test_paid_plan_uses_haiku_and_free_plan_uses_gemma(monkeypatch):
     from services import llm_client
-    import groq
-    err = groq.APIStatusError("rate", response=SimpleNamespace(status_code=429, request=None, headers={}), body=None)
-    err.status_code = 429
-    def boom(**k): raise err
-    fake = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=boom)))
-    monkeypatch.setattr(llm_client, "_get_groq_client", lambda: fake)
-    monkeypatch.setattr(llm_client, "_get_openrouter_client",
-                        lambda: SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **k: _completion(usage=(3, 2))))))
-    monkeypatch.setattr(llm_client, "DEFAULT_LLM_PROVIDER", "groq")
-    c = UsageCollector()
-    t = set_collector(c)
+    used = []
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **k: (used.append(k["model"]), _completion(usage=(3, 2)))[1])))
+    monkeypatch.setattr(llm_client, "_get_openrouter_client", lambda: fake)
+
+    token = set_plan_code("individual")
     try:
         llm_client.ask_llm("s", "u")
     finally:
+        reset_plan_code(token)
+    assert used[-1] == "anthropic/claude-haiku-5.5:nitro"
+
+    token = set_plan_code("maxx")
+    try:
+        llm_client.ask_llm("s", "u")
+    finally:
+        reset_plan_code(token)
+    assert used[-1] == "anthropic/claude-haiku-5.5:nitro"
+
+    token = set_plan_code("free")
+    try:
+        llm_client.ask_llm("s", "u")
+    finally:
+        reset_plan_code(token)
+    assert used[-1] == "google/gemma-4-31b-it:standard"
+
+
+def test_failed_model_attempt_is_not_charged(monkeypatch):
+    from services import llm_client
+    calls = []
+
+    def create(**k):
+        calls.append(k["model"])
+        if len(calls) == 1:
+            raise ValueError("provider down")   # paid chain falls through to :standard
+        return _completion(usage=(3, 2))
+
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr(llm_client, "_get_openrouter_client", lambda: fake)
+    monkeypatch.setattr(llm_client, "_models_for_plan", lambda code: llm_client.OPENROUTER_PAID_MODELS)
+
+    c = UsageCollector()
+    t = set_collector(c)
+    try:
+        assert llm_client.ask_llm("s", "u")
+    finally:
         reset_collector(t)
-    assert (c.input_tokens, c.output_tokens, c.llm_calls) == (3, 2, 1)   # only the successful fallback call
+    assert calls == ["anthropic/claude-haiku-5.5:nitro", "anthropic/claude-haiku-5.5:standard"]
+    assert (c.input_tokens, c.output_tokens, c.llm_calls) == (3, 2, 1)   # only the successful call
+
+
+def test_metered_call_sets_plan_code_for_the_llm_client(monkeypatch):
+    seen = []
+    monkeypatch.setattr(usage_service.billing_service, "get_entitlement",
+                        lambda uid: Entitlement(plan=plan("maxx")))
+    monkeypatch.setattr(usage_service, "record_usage", lambda *a, **k: None)
+    with usage_service.metered_call(7, "transform"):
+        seen.append(current_plan_code())
+    assert seen == ["maxx"]
+    assert current_plan_code() is None    # reset after the request
 
 
 # ───────────────────────── razorpay signatures ─────────────────────────

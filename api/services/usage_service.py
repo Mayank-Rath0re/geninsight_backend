@@ -21,7 +21,13 @@ from typing import Optional
 from fastapi import HTTPException
 
 from core import db
-from core.usage_context import UsageCollector, set_collector, reset_collector
+from core.usage_context import (
+    UsageCollector,
+    reset_collector,
+    reset_plan_code,
+    set_collector,
+    set_plan_code,
+)
 from services import billing_service
 from services.billing_service import Entitlement, Plan, utcnow
 
@@ -189,14 +195,27 @@ def metered_call(user_id: int, kind: str, trace_id: Optional[str] = None):
     Collects LLM tokens for the enclosed work and persists them on exit, even when the
     work raises (the provider already charged for those tokens). Set
     `meter.count_query = True` on success to count toward the Free monthly query cap.
+    Also exposes the user's plan code to llm_client so paid plans get the premium model.
     Enter this INSIDE the endpoint function (see core/usage_context.py).
     """
     collector = UsageCollector()
     token = set_collector(collector)
+
+    # Resolve the plan once per request. If it can't be read, don't guess "paid":
+    # llm_client falls back to the Free/Gemma chain (cheaper and safe).
+    plan_token = None
+    try:
+        plan_token = set_plan_code(billing_service.get_entitlement(user_id).plan.code)
+    except Exception:
+        logger.warning("Could not resolve plan for user %s; using the free model chain.",
+                       user_id, exc_info=True)
+
     try:
         yield collector
     finally:
         reset_collector(token)
+        if plan_token is not None:
+            reset_plan_code(plan_token)
         if collector.total > 0 or collector.count_query:
             try:
                 record_usage(user_id, kind, collector, trace_id)

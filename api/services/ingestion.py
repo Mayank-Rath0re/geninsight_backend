@@ -19,18 +19,23 @@ logger = logging.getLogger("my_global_app_logger")
 
 UNIQUE_VALUES_THRESHOLD = 20
 
+# Rows ever shown to the LLM. The prompt gets exactly this many raw rows; every
+# other signal (dtypes, ranges, null rates, allowed values) comes from computed
+# metadata, never from additional rows.
+SAMPLE_ROWS = 5
+# Rows behind the "statistical summary" block. These are aggregate describe()
+# output, not rows, but the input frame is still bounded so uploads stay fast.
+STATS_ROWS = 2000
+STATS_COLUMNS = 40
+
 
 def get_dataframe(filepath: str) -> pd.DataFrame | None:
     ext = filepath.split("/")[-1].split(".")[-1]
     if ext == "csv":
-        return pd.read_csv(filepath)
+        return pd.read_csv(filepath, low_memory=False)
     if ext in ["xlsx", "xls", "xlsm", "xlsb", "ods"]:
         return pd.read_excel(filepath)
     return None
-
-
-def extract_metadata(filepath: str) -> str:
-    return metadata_from_dataframe(get_dataframe(filepath))
 
 
 def metadata_from_dataframe(dataframe: pd.DataFrame) -> str:
@@ -228,10 +233,12 @@ def build_knowledge_base(
     shape/contract as before) and "session_title" (str).
     """
     # Keep the prompt bounded: full row count goes in the schema block, while the
-    # descriptive stats come from at most 2000 rows / 40 columns.
-    stats_frame = df.iloc[:2000, :40] if len(df) > 2000 or df.shape[1] > 40 else df
+    # descriptive stats come from at most STATS_ROWS rows / STATS_COLUMNS columns
+    # and the raw sample is exactly SAMPLE_ROWS rows.
+    bounded = len(df) > STATS_ROWS or df.shape[1] > STATS_COLUMNS
+    stats_frame = df.iloc[:STATS_ROWS, :STATS_COLUMNS] if bounded else df
     describe_str = stats_frame.describe(include="all").to_string()
-    sample_str = df.head(5).to_string(index=False)
+    sample_str = df.head(SAMPLE_ROWS).to_string(index=False)
     cols = list(df.columns)
 
     system = (
@@ -248,7 +255,7 @@ SCHEMA METADATA:
 STATISTICAL SUMMARY (sampled; SCHEMA METADATA has full-data ranges):
 {describe_str}
 
-SAMPLE ROWS (first 5):
+SAMPLE ROWS (first {SAMPLE_ROWS}):
 {sample_str}
 
 Return exactly this JSON structure (fill in values, keep all keys):

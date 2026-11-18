@@ -5,6 +5,8 @@ no user id is accepted from the request body.
 
   GET  /billing/plans                 public catalog
   GET  /billing/me                    plan + usage + halt state (drives the whole UI)
+  POST /billing/referrals/preview     validate a voucher code and describe the trial
+  POST /billing/referrals/redeem      start the voucher trial (one per code per user)
   POST /billing/subscriptions         create a Razorpay subscription for checkout
   POST /billing/subscriptions/verify  verify checkout signature, grant access
   POST /billing/subscriptions/cancel  cancel at the end of the paid period
@@ -21,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from core import config, db
 from core.security import get_current_user_id
-from services import billing_service, razorpay_service, usage_service
+from services import billing_service, razorpay_service, referral_service, usage_service
 from services.usage_service import iso
 
 logger = logging.getLogger("my_global_app_logger")
@@ -35,8 +37,7 @@ def plans():
     return {"plans": [p.to_dict() for p in billing_service.list_plans()]}
 
 
-@router.get("/me")
-def me(user_id: int = Depends(get_current_user_id)):
+def _me_payload(user_id: int) -> dict:
     ent = billing_service.get_entitlement(user_id)
     snap = usage_service.snapshot(user_id)
     return {
@@ -47,6 +48,8 @@ def me(user_id: int = Depends(get_current_user_id)):
             "current_period_end": iso(ent.period_end),
             "cancel_at_period_end": ent.cancel_at_period_end,
             "is_owner": ent.is_owner,
+            "is_referral": ent.is_referral,
+            "is_test_grant": ent.is_test_grant,
         },
         "usage": {
             "session_tokens": snap.session_tokens,
@@ -58,7 +61,32 @@ def me(user_id: int = Depends(get_current_user_id)):
             "files_used": usage_service.files_used(user_id),
         },
         "halt": usage_service.compute_halt(ent.plan, snap),
+        "referral": referral_service.get_trial(user_id),
     }
+
+
+@router.get("/me")
+def me(user_id: int = Depends(get_current_user_id)):
+    return _me_payload(user_id)
+
+
+# ───────────────────────────── Voucher / referral ─────────────────────────────
+
+class ReferralRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=40)
+
+
+@router.post("/referrals/preview")
+def preview_referral(payload: ReferralRequest,
+                     user_id: int = Depends(get_current_user_id)):
+    return referral_service.preview(user_id, payload.code)
+
+
+@router.post("/referrals/redeem")
+def redeem_referral(payload: ReferralRequest,
+                    user_id: int = Depends(get_current_user_id)):
+    redeemed = referral_service.redeem(user_id, payload.code)
+    return {**_me_payload(user_id), "redeemed": redeemed}
 
 
 # ───────────────────────────── Checkout ─────────────────────────────
@@ -149,7 +177,7 @@ def cancel_subscription(user_id: int = Depends(get_current_user_id)):
     rows = db.fetch(
         "SELECT TOP 1 id, razorpay_subscription_id FROM subscriptions "
         "WHERE owner_user_id = %s AND status = 'active' AND cancel_at_period_end = 0 "
-        "ORDER BY created_at DESC", (user_id,))
+        "AND is_referral = 0 ORDER BY created_at DESC", (user_id,))
     if not rows:
         raise HTTPException(status_code=400, detail="No active subscription to cancel.")
     local_id, rz_id = rows[0]
@@ -265,17 +293,23 @@ def _activate(local_id: int) -> None:
     owner_id, plan_code = row[0]
 
     others = db.fetch(
-        "SELECT id, razorpay_subscription_id FROM subscriptions "
+        "SELECT id, razorpay_subscription_id, is_test_grant, is_referral FROM subscriptions "
         "WHERE owner_user_id = %s AND id <> %s AND status = 'active'", (owner_id, local_id))
-    for other_id, other_rz in others:
-        try:
-            razorpay_service.cancel_subscription(other_rz, at_cycle_end=False)
-        except Exception:
-            logger.exception("Could not cancel superseded subscription %s", other_rz)
+    for other_id, other_rz, is_test, is_referral in others:
+        # Test grants and voucher trials have no Razorpay subscription behind them.
+        if not is_test and not is_referral:
+            try:
+                razorpay_service.cancel_subscription(other_rz, at_cycle_end=False)
+            except Exception:
+                logger.exception("Could not cancel superseded subscription %s", other_rz)
         # NOTE: no proration/refund; the old plan ends immediately.
         db.run("UPDATE subscriptions SET status = 'cancelled', cancel_at_period_end = 0, "
                "cancelled_at = SYSUTCDATETIME(), updated_at = SYSUTCDATETIME() WHERE id = %s",
                (other_id,))
+        if is_referral:
+            db.run("UPDATE referral_redemptions SET status = 'superseded', "
+                   "ended_at = COALESCE(ended_at, SYSUTCDATETIME()) "
+                   "WHERE subscription_id = %s AND status = 'active'", (other_id,))
 
     if plan_code == "enterprise":
         org = db.fetch("SELECT TOP 1 id FROM organizations WHERE owner_user_id = %s", (owner_id,))

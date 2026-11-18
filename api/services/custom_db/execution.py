@@ -87,7 +87,7 @@ def session_data_source_id(session_id: int) -> int | None:
     return rows[0][0] if rows else None
 
 
-def _internal_fetch(sql: str, limit, offset: int) -> dict:
+def _internal_fetch(sql: str, limit, offset: int, params=None) -> dict:
     # Unchanged behaviour: our own SQL Server runs the query as-is (dashboard and
     # preview SQL already carry their own TOP bound), then rows are sliced here.
     # The safety check is repeated here as a last line of defence because stored
@@ -96,7 +96,7 @@ def _internal_fetch(sql: str, limit, offset: int) -> dict:
     if not ok:
         raise ValueError(f"Unsafe SQL rejected: {why}")
 
-    result = db.fetch_with_columns(sql)
+    result = db.fetch_with_columns(sql, params=params)
     rows = result["rows"]
     if offset:
         rows = rows[offset:]
@@ -105,7 +105,7 @@ def _internal_fetch(sql: str, limit, offset: int) -> dict:
     return {"columns": result["columns"], "rows": rows}
 
 
-def _external_fetch(source: dict, sql: str, limit, offset: int) -> dict:
+def _external_fetch(source: dict, sql: str, limit, offset: int, params=None) -> dict:
     ok, why = is_safe_select(sql)
     if not ok:
         raise HTTPException(
@@ -115,7 +115,7 @@ def _external_fetch(source: dict, sql: str, limit, offset: int) -> dict:
 
     try:
         native_sql = dialects.to_native_sql(sql, source["engine"])
-        result = connectors.fetch(source, native_sql, limit=limit, offset=offset)
+        result = connectors.fetch(source, native_sql, params=params, limit=limit, offset=offset)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except connectors.ExternalDBError as exc:
@@ -133,22 +133,22 @@ def _external_fetch(source: dict, sql: str, limit, offset: int) -> dict:
     return result
 
 
-def run_for_session(session_id: int, sql: str, limit=None, offset: int = 0) -> dict:
+def run_for_session(session_id: int, sql: str, limit=None, offset: int = 0, params=None) -> dict:
     source = resolve_session_source(session_id)
     if source is None:
-        return _internal_fetch(sql, limit, offset)
+        return _internal_fetch(sql, limit, offset, params)
 
     effective = config.CUSTOM_DB_MAX_ROWS if limit is None else min(limit, config.CUSTOM_DB_MAX_ROWS)
-    return _external_fetch(source, sql, effective, offset)
+    return _external_fetch(source, sql, effective, offset, params)
 
 
-def run_for_table(table_id: int, sql: str, limit=None, offset: int = 0) -> dict:
+def run_for_table(table_id: int, sql: str, limit=None, offset: int = 0, params=None) -> dict:
     source = resolve_table_source(table_id)
     if source is None:
-        return _internal_fetch(sql, limit, offset)
+        return _internal_fetch(sql, limit, offset, params)
 
     effective = config.CUSTOM_DB_MAX_ROWS if limit is None else min(limit, config.CUSTOM_DB_MAX_ROWS)
-    return _external_fetch(source, sql, effective, offset)
+    return _external_fetch(source, sql, effective, offset, params)
 
 
 def quote_tsql(name: str) -> str:
@@ -160,11 +160,11 @@ def fetch_columns_for_table(table_id: int, table_name: str) -> list:
     return run_for_table(table_id, sql, limit=None)["columns"]
 
 
-def count_rows_for_table(table_id: int, table_name: str):
+def count_rows_for_table(table_id: int, table_name: str, where: str = "", params=None):
     """Exact row count; custom-DB failures degrade to None instead of failing a preview."""
-    sql = f"SELECT COUNT(*) FROM {quote_tsql(table_name)}"
+    sql = f"SELECT COUNT(*) FROM {quote_tsql(table_name)}{where}"
     try:
-        result = run_for_table(table_id, sql, limit=None)
+        result = run_for_table(table_id, sql, limit=None, params=params)
     except HTTPException:
         return None
     return int(result["rows"][0][0]) if result["rows"] else None

@@ -208,7 +208,9 @@ def perform_merge(target_session_id: int, source_session_id: int, user_id: int, 
         # commits here — pipeline runs after, same pattern as /transform
 
         try:
-            output = pipeline.run_pipeline_result(target_session_id, query_obj_id)
+            output = pipeline.run_pipeline_result(
+                target_session_id, query_obj_id, limit=pipeline.FIRST_PAGE_ROWS
+            )
         except Exception:
             try:
                 db.run("DELETE FROM queries WHERE id = %s", (query_obj_id,))

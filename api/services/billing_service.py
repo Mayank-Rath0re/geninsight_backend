@@ -89,11 +89,16 @@ class Entitlement:
     cancel_at_period_end: bool = False
     org_id: Optional[int] = None
     is_owner: bool = True
+    is_referral: bool = False
+    is_test_grant: bool = False
 
 
 def _is_entitled(status: str, period_end: Optional[datetime],
-                 cancel_at_period_end: bool, now: datetime) -> bool:
+                 cancel_at_period_end: bool, now: datetime,
+                 honor_grace: bool = True) -> bool:
     if status == "active":
+        if not honor_grace:
+            return period_end is None or now < period_end
         return period_end is None or now < period_end + RENEWAL_GRACE
     if status == "cancelled":
         # Cancelled-at-cycle-end keeps access until the paid period runs out.
@@ -105,12 +110,17 @@ def get_entitlement(user_id: int) -> Entitlement:
     """
     Effective plan for a user: the best entitled subscription they own, or that
     belongs to an org they are an active member of. Falls back to Free.
+
+    Precedence between equally valid subscriptions: a real/paid or referral
+    subscription beats a testing-phase grant (is_test_grant), then the pricier
+    plan wins; a referral loses a tie against a paid subscription of the same plan.
     """
     now = utcnow()
     rows = db.fetch(
         """
         SELECT s.id, s.plan_id, s.status, s.seats, s.current_period_end,
-               s.cancel_at_period_end, s.org_id, s.owner_user_id
+               s.cancel_at_period_end, s.org_id, s.owner_user_id,
+               s.is_referral, s.is_test_grant
         FROM subscriptions s
         WHERE s.status IN ('active', 'cancelled')
           AND (s.owner_user_id = %s
@@ -120,17 +130,27 @@ def get_entitlement(user_id: int) -> Entitlement:
         (user_id, user_id),
     )
     best: Optional[Entitlement] = None
-    for sid, plan_id, status, seats, period_end, cancel_flag, org_id, owner_id in rows:
-        if not _is_entitled(status, period_end, bool(cancel_flag), now):
+    best_key = None
+    for row in rows:
+        # row[:8] keeps older 8-column fixtures working.
+        sid, plan_id, status, seats, period_end, cancel_flag, org_id, owner_id = row[:8]
+        is_referral = bool(row[8]) if len(row) > 8 else False
+        is_test_grant = bool(row[9]) if len(row) > 9 else False
+        # A referral ends exactly at current_period_end: no renewal grace.
+        if not _is_entitled(status, period_end, bool(cancel_flag), now,
+                            honor_grace=not is_referral):
             continue
         plan = get_plan_by_id(plan_id)
         if plan is None:
             continue
-        cand = Entitlement(plan=plan, seats=seats, subscription_id=sid, status=status,
+        key = (0 if is_test_grant else 1, plan.price, 0 if is_referral else 1)
+        if best is not None and key <= best_key:
+            continue
+        best_key = key
+        best = Entitlement(plan=plan, seats=seats, subscription_id=sid, status=status,
                            period_end=period_end, cancel_at_period_end=bool(cancel_flag),
-                           org_id=org_id, is_owner=(owner_id == user_id))
-        if best is None or plan.price > best.plan.price:
-            best = cand
+                           org_id=org_id, is_owner=(owner_id == user_id),
+                           is_referral=is_referral, is_test_grant=is_test_grant)
     if best is not None:
         return best
 

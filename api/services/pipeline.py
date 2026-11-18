@@ -5,6 +5,10 @@ from core import db
 from core.sql_safety import mask_sql
 from services.custom_db import execution
 
+# Rows returned inline when a step is created (transform/merge). The client
+# pages the rest through /pipeline_result instead of holding the whole table.
+FIRST_PAGE_ROWS = 200
+
 def _fetch_session_table_name(session_id: int) -> str:
     rows = db.fetch(
         "SELECT t.name FROM table_info t "
@@ -208,20 +212,139 @@ def _assemble_chain(session_id: int, query_id: int, alias_prefix: str, used_pref
 
     return cte_parts, prev_alias
 
-def assemble_cte_query(session_id: int, query_id: int) -> str:
+def _cte_sql(session_id: int, query_id: int) -> tuple:
     cte_parts, final_alias = _assemble_chain(
         session_id, query_id, alias_prefix="cte", used_prefixes=set()
     )
-    cte_body = "WITH " + ",\n".join(cte_parts)
+    return "WITH " + ",\n".join(cte_parts) + "\n", final_alias
+
+
+def assemble_cte_query(session_id: int, query_id: int) -> str:
+    cte_body, final_alias = _cte_sql(session_id, query_id)
     order = _final_order_by(session_id, query_id)
     tail = f"SELECT * FROM {final_alias}" + (f" ORDER BY {order}" if order else "")
-    return f"{cte_body}\n{tail}"
+    return f"{cte_body}{tail}"
 
-def run_pipeline_result(session_id: int, query_id: int, limit: int = 0, offset: int = 0):
-    assembled_cte_query = assemble_cte_query(session_id=session_id, query_id=query_id)
-    return execution.run_for_session(
-        session_id,
-        assembled_cte_query,
-        limit=limit or None,
-        offset=offset,
+
+def _search_clause(search, search_columns) -> tuple:
+    """Server-side search across the caller's columns. Identifiers are quoted and
+    the pattern is parameterised, so neither can alter the statement.
+
+    NVARCHAR(1000), not NVARCHAR(MAX): sqlglot translates MAX to VARCHAR(MAX),
+    which MySQL rejects. 1000 characters is plenty for matching a search term.
+    """
+    term = (search or "").strip()
+    if not term or not search_columns:
+        return "", ()
+
+    pattern = f"%{term}%"
+    conditions, params = [], []
+    for col in search_columns:
+        if not isinstance(col, str) or not col.strip():
+            continue
+        conditions.append(
+            f"CAST(__r.{execution.quote_tsql(col)} AS NVARCHAR(1000)) LIKE %s"
+        )
+        params.append(pattern)
+
+    if not conditions:
+        return "", ()
+    return " WHERE " + " OR ".join(conditions), tuple(params)
+
+
+def _count_query(session_id: int, query_id: int, search, search_columns) -> tuple:
+    cte_body, final_alias = _cte_sql(session_id, query_id)
+    where, params = _search_clause(search, search_columns)
+    return (
+        f"{cte_body}SELECT COUNT(*) AS __total_count FROM {final_alias} AS __r{where}",
+        params,
     )
+
+
+def build_result_query(
+    session_id: int,
+    query_id: int,
+    sort_by: str | None = None,
+    sort_dir: str = "asc",
+    search: str | None = None,
+    search_columns: list | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    include_total: bool = False,
+) -> tuple:
+    """Build a single page of the pipeline result.
+
+    Pagination/filtering happens in the database, so a 600k-row session no
+    longer ships its whole result set to the client.
+    """
+    cte_body, final_alias = _cte_sql(session_id, query_id)
+    where, params = _search_clause(search, search_columns)
+
+    select_list = "__r.*"
+    if include_total:
+        # Window functions are evaluated before OFFSET/FETCH, so this is the
+        # filtered total while still fetching only the requested page.
+        select_list += ", COUNT(*) OVER() AS __total_count"
+
+    sql = f"{cte_body}SELECT {select_list} FROM {final_alias} AS __r{where}"
+    if sort_by:
+        direction = "DESC" if str(sort_dir).lower() == "desc" else "ASC"
+        sql += f" ORDER BY {execution.quote_tsql(sort_by)} {direction}"
+    elif limit is not None:
+        # Preserve the step's own ordering; OFFSET/FETCH requires an ORDER BY.
+        sql += f" ORDER BY {_final_order_by(session_id, query_id) or '1'}"
+    if limit is not None:
+        sql += f" OFFSET {int(offset)} ROWS FETCH NEXT {int(limit)} ROWS ONLY"
+    return sql, params
+
+
+def _total_rows(session_id: int, query_id: int, search, search_columns) -> int:
+    sql, params = _count_query(session_id, query_id, search, search_columns)
+    result = execution.run_for_session(session_id, sql, limit=None, params=params)
+    return int(result["rows"][0][0] or 0) if result["rows"] else 0
+
+
+def run_pipeline_result(
+    session_id: int,
+    query_id: int,
+    limit: int | None = None,
+    offset: int = 0,
+    sort_by: str | None = None,
+    sort_dir: str = "asc",
+    search: str | None = None,
+    search_columns: list | None = None,
+) -> dict:
+    """Run the assembled pipeline.
+
+    With `limit=None` this returns the complete result (exports). Otherwise a
+    single page is fetched, with `total_count` for the paginated UI.
+    """
+    if limit is None and not search and not sort_by:
+        return execution.run_for_session(
+            session_id, assemble_cte_query(session_id, query_id), limit=None
+        )
+
+    external = execution.resolve_session_source(session_id) is not None
+    include_total = limit is not None and not external
+    sql, params = build_result_query(
+        session_id,
+        query_id,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        search=search,
+        search_columns=search_columns,
+        limit=limit,
+        offset=offset,
+        include_total=include_total,
+    )
+    result = execution.run_for_session(session_id, sql, limit=None, params=params)
+
+    if limit is not None:
+        if include_total and result["rows"]:
+            result["columns"] = result["columns"][:-1]
+            result["total_count"] = int(result["rows"][0][-1] or 0)
+            result["rows"] = [row[:-1] for row in result["rows"]]
+        else:
+            # Custom DBs (or an out-of-range page) need an explicit count.
+            result["total_count"] = _total_rows(session_id, query_id, search, search_columns)
+    return result

@@ -3,7 +3,7 @@
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from core import db
@@ -158,14 +158,38 @@ def delete_session(session_id: int, user_id: int, authed_user_id: int = Depends(
                 dataset_cleanup.drop_physical_table_if_unused(table_id, table_name)
 
 
+MAX_PAGE_SIZE = 500
+
+
 @router.get("/pipeline_result")
-def pipeline_result(sessionId: int, userId: int, queryId: int, authed_user_id: int = Depends(get_current_user_id)):
+def pipeline_result(
+    sessionId: int,
+    userId: int,
+    queryId: int,
+    limit: int = 200,
+    offset: int = 0,
+    sort_by: str | None = None,
+    sort_dir: str = "asc",
+    search: str | None = None,
+    search_columns: list[str] | None = Query(default=None),
+    authed_user_id: int = Depends(get_current_user_id),
+):
     """
     Re-runs the CTE-chained pipeline for sessionId, truncated to (and
     including) queryId. queryId=-1 runs the full pipeline. Used to
     preview any historical step without mutating it.
+
+    The result is paginated in the database: only `limit` rows starting at
+    `offset` are fetched, sorted and searched server-side, and `total_count`
+    describes the filtered result so the client never holds the whole table.
     """
     require_same_user(authed_user_id, userId)
+    limit = max(1, min(int(limit or 0), MAX_PAGE_SIZE))
+    offset = max(0, int(offset or 0))
+    if sort_dir.lower() not in ("asc", "desc"):
+        sort_dir = "asc"
+    search = (search or "").strip() or None
+    columns = [c for c in (search_columns or []) if isinstance(c, str) and c.strip()] or None
     try:
         row = db.fetch(
             "SELECT TOP 1 user_id FROM sessions WHERE session_id = %s AND is_deleted = 0",
@@ -177,7 +201,16 @@ def pipeline_result(sessionId: int, userId: int, queryId: int, authed_user_id: i
             raise HTTPException(status_code=401, detail="User Mismatch")
 
         try:
-            output = pipeline.run_pipeline_result(sessionId, queryId)
+            output = pipeline.run_pipeline_result(
+                sessionId,
+                queryId,
+                limit=limit,
+                offset=offset,
+                sort_by=sort_by,
+                sort_dir=sort_dir,
+                search=search,
+                search_columns=columns,
+            )
         except ValueError as e:
             logger.warning("Pipeline result invalid for session %s, query %s: %s", sessionId, queryId, e)
             raise HTTPException(

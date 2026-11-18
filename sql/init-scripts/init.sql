@@ -389,6 +389,13 @@ IF COL_LENGTH('subscriptions', 'is_test_grant') IS NULL
     ALTER TABLE subscriptions ADD is_test_grant BIT NOT NULL DEFAULT 0;
 GO
 
+-- 1 = the subscription was created by redeeming a voucher code (see referral_codes).
+-- Referral subscriptions have no Razorpay id behind them; they do not get the
+-- renewal grace and they end exactly at current_period_end.
+IF COL_LENGTH('subscriptions', 'is_referral') IS NULL
+    ALTER TABLE subscriptions ADD is_referral BIT NOT NULL DEFAULT 0;
+GO
+
 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='payments' AND xtype='U')
 BEGIN
     CREATE TABLE payments (
@@ -488,6 +495,60 @@ UPDATE plans SET max_data_sources = 2    WHERE code = 'free';
 UPDATE plans SET max_data_sources = 10   WHERE code = 'individual';
 UPDATE plans SET max_data_sources = 25   WHERE code = 'maxx';
 UPDATE plans SET max_data_sources = NULL WHERE code = 'enterprise';
+GO
+
+-- ═══════════════════════════ Referral / voucher codes ═══════════════════════════
+-- A voucher is an admin-defined grant: duration_days of plan_id, redeemable by at
+-- most max_redemptions distinct users (NULL = unlimited). Redemption creates a
+-- subscription row with is_referral = 1 and a synthetic razorpay_subscription_id.
+-- Codes are inserted/edited directly by the admin team; there is no admin UI.
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='referral_codes' AND xtype='U')
+BEGIN
+    CREATE TABLE referral_codes (
+        id               INT IDENTITY(1,1) PRIMARY KEY,
+        code             VARCHAR(40)  NOT NULL,             -- stored upper-case, matched case-insensitively
+        plan_id          INT          NOT NULL,
+        duration_days    INT          NOT NULL DEFAULT 30,
+        max_redemptions  INT          NULL,                 -- NULL = unlimited
+        redeemed_count   INT          NOT NULL DEFAULT 0,
+        is_active        BIT          NOT NULL DEFAULT 1,
+        valid_until      DATETIME2    NULL,                 -- NULL = the code never expires
+        note             NVARCHAR(400) NULL,
+        created_at       DATETIME2    NOT NULL DEFAULT SYSUTCDATETIME(),
+        updated_at       DATETIME2    NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT fk_refcode_plan FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE NO ACTION
+    );
+    CREATE UNIQUE INDEX uq_refcode_code ON referral_codes(code);
+END
+GO
+
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='referral_redemptions' AND xtype='U')
+BEGIN
+    CREATE TABLE referral_redemptions (
+        id              INT IDENTITY(1,1) PRIMARY KEY,
+        code_id         INT          NOT NULL,
+        user_id         INT          NOT NULL,
+        subscription_id INT          NOT NULL,
+        status          VARCHAR(12)  NOT NULL DEFAULT 'active'
+            CONSTRAINT chk_refred_status CHECK (status IN ('active', 'expired', 'revoked', 'superseded')),
+        redeemed_at     DATETIME2    NOT NULL DEFAULT SYSUTCDATETIME(),
+        expires_at      DATETIME2    NOT NULL,
+        ended_at        DATETIME2    NULL,
+        CONSTRAINT fk_refred_code FOREIGN KEY (code_id)         REFERENCES referral_codes(id) ON DELETE NO ACTION,
+        CONSTRAINT fk_refred_user FOREIGN KEY (user_id)         REFERENCES auth(id) ON DELETE NO ACTION,
+        CONSTRAINT fk_refred_sub  FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE NO ACTION
+    );
+    CREATE UNIQUE INDEX uq_refred_user_code ON referral_redemptions(user_id, code_id);  -- one redemption per user per code
+    CREATE INDEX ix_refred_user ON referral_redemptions(user_id, status);
+    CREATE INDEX ix_refred_expiry ON referral_redemptions(status, expires_at);
+END
+GO
+
+-- Sample voucher for testing: 1 month of Individual, 100 redemptions.
+IF NOT EXISTS (SELECT 1 FROM referral_codes WHERE code = 'AMOEBA100')
+    INSERT INTO referral_codes (code, plan_id, duration_days, max_redemptions, note)
+    SELECT 'AMOEBA100', id, 30, 100, N'Sample voucher: 30 days of Individual. 100 redemptions.'
+    FROM plans WHERE code = 'individual';
 GO
 
 -- ═══════════════════ TESTING PHASE: every new account gets Maxx ═══════════════════

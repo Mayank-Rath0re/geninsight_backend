@@ -50,10 +50,12 @@ def _install_stubs():
             from fastapi import HTTPException
             raise HTTPException(status_code=401, detail="User Mismatch")
 
-    _stub("core.security", get_current_user_id=get_current_user_id, require_same_user=require_same_user)
+    _stub("core.security", get_current_user_id=get_current_user_id, require_same_user=require_same_user,
+          hash_password=lambda p: p, verify_password=lambda p, h: True)
     _stub("core.ai_trace", new_trace_id=lambda: "trace-1", log_ai_event=lambda *a, **k: None)
     _stub("core.sql_safety", classify_sql_error=lambda e: {"code": "UNKNOWN", "retryable": False},
-          sanitize_sql=lambda s: s)
+          sanitize_sql=lambda s: s, is_safe_select=lambda s: (True, ""),
+          mask_sql=lambda s, nested=False: s, ensure_order_by_safe=lambda s: s)
     for name in ("pipeline", "query_generation", "table_ingest", "email_service", "token_service",
                  "dataset_cleanup"):
         _stub(f"services.{name}")

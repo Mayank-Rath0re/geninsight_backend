@@ -157,7 +157,9 @@ def _transform_impl(payload: models.TransformPayload, trace_id: str) -> dict:
         output, last = None, None
         for attempt in range(MAX_SQL_ATTEMPTS):
             try:
-                output = pipeline.run_pipeline_result(sessionId, queryObjId)
+                output = pipeline.run_pipeline_result(
+                    sessionId, queryObjId, limit=pipeline.FIRST_PAGE_ROWS
+                )
                 break
             except HTTPException:
                 # Revoked/missing custom DB: not an SQL problem, so don't repair —

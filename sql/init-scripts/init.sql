@@ -21,7 +21,7 @@ BEGIN
         refresh_token_expires_at  DATETIME2 NULL,
         is_deleted                BIT NOT NULL DEFAULT 0,
         deleted_at                DATETIME2 NULL,
-        created_at                DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+        created_at                DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
     );
     CREATE UNIQUE INDEX uq_auth_email ON auth(email);
 END
@@ -59,8 +59,8 @@ BEGIN
         last_error        NVARCHAR(4000) NULL,
         is_deleted        BIT NOT NULL DEFAULT 0,
         deleted_at        DATETIME2 NULL,
-        created_at        DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
-        updated_at        DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+        created_at        DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        updated_at        DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
         CONSTRAINT fk_ds_user FOREIGN KEY (user_id)
             REFERENCES auth(id) ON DELETE CASCADE
     );
@@ -76,7 +76,7 @@ IF COL_LENGTH('data_sources', 'last_error') IS NULL
     ALTER TABLE data_sources ADD last_error NVARCHAR(4000) NULL;
 GO
 IF COL_LENGTH('data_sources', 'updated_at') IS NULL
-    ALTER TABLE data_sources ADD updated_at DATETIME2 NOT NULL CONSTRAINT df_ds_updated_at DEFAULT SYSDATETIME();
+    ALTER TABLE data_sources ADD updated_at DATETIME2 NOT NULL CONSTRAINT df_ds_updated_at DEFAULT SYSUTCDATETIME();
 GO
 IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'ix_data_sources_user_active')
     CREATE INDEX ix_data_sources_user_active ON data_sources(user_id, is_deleted);
@@ -126,8 +126,8 @@ BEGIN
         session_title NVARCHAR(255),
         user_id       INT NULL,
         table_id      INT NOT NULL,
-        date_created  DATETIME2 DEFAULT SYSDATETIME(),
-        date_modified DATETIME2 DEFAULT SYSDATETIME(),
+        date_created  DATETIME2 DEFAULT SYSUTCDATETIME(),
+        date_modified DATETIME2 DEFAULT SYSUTCDATETIME(),
         is_deleted    BIT NOT NULL DEFAULT 0,
         deleted_at    DATETIME2 NULL,
         CONSTRAINT fk_sessions_user FOREIGN KEY (user_id)
@@ -156,7 +156,7 @@ BEGIN
         join_summary       NVARCHAR(MAX) NULL,
         is_deleted         BIT NOT NULL DEFAULT 0,
         deleted_at         DATETIME2 NULL,
-        created_at         DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+        created_at         DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
         CONSTRAINT fk_queries_session FOREIGN KEY (session_id)
             REFERENCES sessions(session_id) ON DELETE CASCADE,
         CONSTRAINT fk_queries_source_session FOREIGN KEY (source_session_id)
@@ -183,7 +183,7 @@ BEGIN
         metadata   NVARCHAR(MAX) NULL,
         is_deleted BIT NOT NULL DEFAULT 0,
         deleted_at DATETIME2 NULL,
-        created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+        created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
         CONSTRAINT fk_charts_session FOREIGN KEY (session_id)
             REFERENCES sessions(session_id) ON DELETE CASCADE
     );
@@ -209,8 +209,8 @@ BEGIN
         shared_at        DATETIME2 NULL,
         is_deleted       BIT NOT NULL DEFAULT 0,
         deleted_at       DATETIME2 NULL,
-        created_at       DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
-        updated_at       DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+        created_at       DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        updated_at       DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
         CONSTRAINT fk_dashboards_user FOREIGN KEY (user_id)
             REFERENCES auth(id) ON DELETE CASCADE,
         CONSTRAINT fk_dashboards_table FOREIGN KEY (table_id)
@@ -236,8 +236,8 @@ BEGIN
         shared_at     DATETIME2 NULL,
         is_deleted    BIT NOT NULL DEFAULT 0,
         deleted_at    DATETIME2 NULL,
-        created_at    DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
-        updated_at    DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+        created_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        updated_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
         CONSTRAINT fk_analyst_reports_user FOREIGN KEY (user_id)
             REFERENCES auth(id) ON DELETE CASCADE,
         CONSTRAINT fk_analyst_reports_table FOREIGN KEY (table_id)
@@ -271,7 +271,7 @@ BEGIN
         token      VARCHAR(255) NOT NULL,
         expires_at DATETIME2 NOT NULL,
         used       BIT NOT NULL DEFAULT 0,
-        created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+        created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
         CONSTRAINT fk_prt_user FOREIGN KEY (user_id)
             REFERENCES auth(id) ON DELETE CASCADE
     );
@@ -287,7 +287,7 @@ BEGIN
         email_id     VARCHAR(255) NOT NULL,
         otp_no       VARCHAR(10) NOT NULL,
         usageCode    VARCHAR(30) NOT NULL,
-        insertedTime DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+        insertedTime DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
     );
     CREATE INDEX ix_otp_email_usage ON OTP(email_id, usageCode);
     CREATE INDEX ix_otp_insertedTime ON OTP(insertedTime);

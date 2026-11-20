@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from core import db
 from core.security import get_current_user_id, require_same_user
+from core.timeutils import iso_utc
 
 logger = logging.getLogger("my_global_app_logger")
 router = APIRouter(tags=["query"])
@@ -50,7 +51,7 @@ def get_query(queryId: int, userId: int, authed_user_id: int = Depends(get_curre
         "source_session_id": r[7],
         "join_type": r[8],
         "join_summary": r[9],
-        "created_at": r[10].isoformat() if r[10] else None,
+        "created_at": iso_utc(r[10]),
     }
 
 
@@ -71,7 +72,7 @@ def delete_query(queryId: int, userId: int, authed_user_id: int = Depends(get_cu
         raise HTTPException(status_code=404, detail="Query not found")
 
     db.run(
-        "UPDATE queries SET is_deleted = 1, deleted_at = SYSDATETIME() WHERE id = %s",
+        "UPDATE queries SET is_deleted = 1, deleted_at = SYSUTCDATETIME() WHERE id = %s",
         (queryId,),
     )
     return {"queryId": queryId, "deleted": True}

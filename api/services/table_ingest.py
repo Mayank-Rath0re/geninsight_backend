@@ -207,7 +207,7 @@ def ingest_table_and_session_from_path(
 
         cursor.execute(
             "INSERT INTO table_info (name, user_id, knowledgebase, metadata, createdAt) "
-            "VALUES (%s, %s, %s, %s, SYSDATETIME())",
+            "VALUES (%s, %s, %s, %s, SYSUTCDATETIME())",
             (table_name, user_id, kb, metadata),
         )
         cursor.execute("SELECT id FROM table_info WHERE name = %s", (table_name,))

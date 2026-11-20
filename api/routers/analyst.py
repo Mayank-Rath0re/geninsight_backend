@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from core import db
 from core.ai_trace import log_ai_event, new_trace_id
 from core.security import get_current_user_id
+from core.timeutils import iso_utc as _iso
 from services import analyst as analyst_service
 from services import analyst_pdf
 from services import usage_service
@@ -38,10 +39,6 @@ router = APIRouter(tags=["analyst"])
 #    is metered.
 #  - A run counts toward the Free monthly query cap only when it used the AI
 #    and succeeded (meter.llm_calls > 0).
-
-
-def _iso(value):
-    return value.isoformat() if value else None
 
 
 def _parse_payload(raw) -> dict:
@@ -128,7 +125,7 @@ def _save_report(user_id: int, table_id: int, result: dict, title: str):
         if existing:
             db.run(
                 "UPDATE analyst_reports SET payload = %s, title = %s, "
-                "updated_at = SYSDATETIME() WHERE report_id = %s",
+                "updated_at = SYSUTCDATETIME() WHERE report_id = %s",
                 (json.dumps(result, default=str), title[:200], existing),
             )
             return existing
@@ -324,7 +321,7 @@ def delete_analyst_report(payload: DeleteAnalystReportRequest,
     _check_report_owner(payload.report_id, payload.userId)
 
     db.run(
-        "UPDATE analyst_reports SET is_deleted = 1, deleted_at = SYSDATETIME(), "
+        "UPDATE analyst_reports SET is_deleted = 1, deleted_at = SYSUTCDATETIME(), "
         "is_shared = 0, share_token = NULL, shared_snapshot = NULL, shared_at = NULL "
         "WHERE report_id = %s",
         (payload.report_id,),
@@ -394,7 +391,7 @@ def share_analyst_report(payload: ShareAnalystReportRequest,
         token = token or secrets.token_urlsafe(24)
         db.run(
             "UPDATE analyst_reports SET is_shared = 1, share_token = %s, shared_snapshot = %s, "
-            "shared_at = SYSDATETIME() WHERE report_id = %s",
+            "shared_at = SYSUTCDATETIME() WHERE report_id = %s",
             (token, json.dumps(snapshot, default=str), payload.report_id),
         )
         log_ai_event(trace_id, "analyst.share_enabled", report_id=payload.report_id,

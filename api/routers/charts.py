@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from core import db
 from core.security import get_current_user_id, require_same_user
+from core.timeutils import iso_utc
 
 logger = logging.getLogger("my_global_app_logger")
 router = APIRouter(tags=["charts"])
@@ -106,7 +107,7 @@ def get_session_charts(session_id: int, userId: int, authed_user_id: int = Depen
                 "prompt": r[2],
                 "sql_query": r[3],
                 "metadata": json.loads(r[4]) if r[4] else {},
-                "created_at": r[5].isoformat() if r[5] else None,
+                "created_at": iso_utc(r[5]),
             }
             for r in rows
         ]
@@ -117,7 +118,7 @@ def get_session_charts(session_id: int, userId: int, authed_user_id: int = Depen
 def delete_chart(chart_id: int, userId: int, authed_user_id: int = Depends(get_current_user_id)):
     require_same_user(authed_user_id, userId)
     _check_chart_owner(chart_id, authed_user_id)
-    db.run("UPDATE charts SET is_deleted = 1, deleted_at = SYSDATETIME() WHERE chart_id = %s", (chart_id,))
+    db.run("UPDATE charts SET is_deleted = 1, deleted_at = SYSUTCDATETIME() WHERE chart_id = %s", (chart_id,))
     return {"chart_id": chart_id, "deleted": True}
 
 

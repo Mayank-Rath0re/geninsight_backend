@@ -69,13 +69,13 @@ def run_purge_sweep() -> dict:
     rows = db.fetch(
         "SELECT id, name FROM table_info "
         "WHERE is_deleted = 1 AND purged_at IS NULL AND data_source_id IS NULL "
-        f"AND deleted_at < DATEADD(day, -{grace}, SYSDATETIME())"
+        f"AND deleted_at < DATEADD(day, -{grace}, SYSUTCDATETIME())"
     )
     purged = 0
     for table_id, name in rows:
         try:
             if dataset_cleanup.drop_physical_table_if_unused(table_id, name):
-                db.run("UPDATE table_info SET purged_at = SYSDATETIME() WHERE id = %s", (table_id,))
+                db.run("UPDATE table_info SET purged_at = SYSUTCDATETIME() WHERE id = %s", (table_id,))
                 purged += 1
         except Exception:
             logger.exception("Purge failed for table %s", table_id)

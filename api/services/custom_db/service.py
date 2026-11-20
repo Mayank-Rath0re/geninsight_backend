@@ -13,6 +13,7 @@ import logging
 from fastapi import HTTPException
 
 from core import config, crypto, db
+from core.timeutils import iso_utc as _iso
 from services import billing_service, dataset_cleanup
 from services.custom_db import connectors, dialects, introspection
 
@@ -26,10 +27,6 @@ _SOURCE_COLS = (
     "id, user_id, name, engine, host, port, database_name, username, "
     "secret_encrypted, ssl_enabled, status, last_connected_at, last_error, created_at"
 )
-
-
-def _iso(value):
-    return value.isoformat() if value else None
 
 
 def _public(row, table_count: int = 0) -> dict:
@@ -230,7 +227,7 @@ def _register_tables(cur, user_id: int, source_id: int, schema, described: list[
             cur.execute(
                 "INSERT INTO table_info "
                 "(name, user_id, data_source_id, source_table, source_schema, knowledgebase, metadata, createdAt) "
-                "OUTPUT INSERTED.id VALUES (%s, %s, %s, %s, %s, %s, %s, SYSDATETIME())",
+                "OUTPUT INSERTED.id VALUES (%s, %s, %s, %s, %s, %s, %s, SYSUTCDATETIME())",
                 (
                     table["name"], user_id, source_id, table["name"], schema,
                     table["knowledgebase"], table["metadata"],
@@ -341,7 +338,7 @@ def create_source(user_id: int, payload: dict, selected_tables=None) -> dict:
             "INSERT INTO data_sources "
             "(user_id, name, engine, host, port, database_name, username, secret_encrypted, "
             " ssl_enabled, status, last_connected_at) "
-            "OUTPUT INSERTED.id VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', SYSDATETIME())",
+            "OUTPUT INSERTED.id VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', SYSUTCDATETIME())",
             (
                 user_id, details["name"], details["dbtype"], details["host"], details["port"],
                 details["dbname"], details["dbuser"], encrypted, 1 if details["ssl"] else 0,
@@ -440,8 +437,8 @@ def update_source(user_id: int, source_id: int, payload: dict, selected_tables=N
         cur.execute(
             "UPDATE data_sources SET name = %s, engine = %s, host = %s, port = %s, "
             "database_name = %s, username = %s, secret_encrypted = %s, ssl_enabled = %s, "
-            "status = 'active', last_connected_at = SYSDATETIME(), last_error = NULL, "
-            "updated_at = SYSDATETIME() WHERE id = %s",
+            "status = 'active', last_connected_at = SYSUTCDATETIME(), last_error = NULL, "
+            "updated_at = SYSUTCDATETIME() WHERE id = %s",
             (
                 details["name"], details["dbtype"], details["host"], details["port"],
                 details["dbname"], details["dbuser"], encrypted, 1 if details["ssl"] else 0,
@@ -491,8 +488,8 @@ def delete_source(user_id: int, source_id: int) -> dict:
             dataset_cleanup.soft_delete_dataset(cur, table_id)
 
         cur.execute(
-            "UPDATE data_sources SET is_deleted = 1, deleted_at = SYSDATETIME(), "
-            "status = 'revoked', secret_encrypted = '', updated_at = SYSDATETIME() "
+            "UPDATE data_sources SET is_deleted = 1, deleted_at = SYSUTCDATETIME(), "
+            "status = 'revoked', secret_encrypted = '', updated_at = SYSUTCDATETIME() "
             "WHERE id = %s",
             (source_id,),
         )
@@ -536,8 +533,8 @@ def remote_tables(user_id: int, source_id: int) -> dict:
 def _mark_status(source_id: int, ok: bool, error: str | None = None) -> None:
     try:
         db.run(
-            "UPDATE data_sources SET status = %s, last_connected_at = SYSDATETIME(), "
-            "last_error = %s, updated_at = SYSDATETIME() WHERE id = %s",
+            "UPDATE data_sources SET status = %s, last_connected_at = SYSUTCDATETIME(), "
+            "last_error = %s, updated_at = SYSUTCDATETIME() WHERE id = %s",
             ("active" if ok else "unreachable", None if ok else (error or "")[:4000], source_id),
         )
     except Exception:

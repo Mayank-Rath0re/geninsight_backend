@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from core import db
 from core.rate_limit import RateLimiter
 from core.security import get_current_user_id, hash_password, require_same_user, verify_password
+from core.timeutils import iso_utc as _iso
 from services import dataset_cleanup
 
 logger = logging.getLogger("my_global_app_logger")
@@ -17,9 +18,6 @@ sensitive_limiter = RateLimiter(max_calls=5, window_seconds=60)
 MIN_PASSWORD_LENGTH = 8
 MAX_PASSWORD_LENGTH = 128
 MAX_NAME_LENGTH = 100
-
-def _iso(value):
-    return value.isoformat() if value else None
 
 def _profile(user_id: int) -> dict:
     rows = db.fetch(
@@ -138,7 +136,7 @@ def get_usage(authed_user_id: int = Depends(get_current_user_id)):
             "queries_this_month": _count(
                 "SELECT COUNT(*) FROM queries q JOIN sessions s ON s.session_id = q.session_id "
                 "WHERE s.user_id = %s AND q.is_deleted = 0 AND q.prompt <> 'Load data' "
-                "AND q.created_at >= DATEFROMPARTS(YEAR(SYSDATETIME()), MONTH(SYSDATETIME()), 1)",
+                "AND q.created_at >= DATEFROMPARTS(YEAR(SYSUTCDATETIME()), MONTH(SYSUTCDATETIME()), 1)",
                 uid,
             ),
             "data_sources": _count("SELECT COUNT(*) FROM data_sources WHERE user_id = %s AND is_deleted = 0", uid),
@@ -261,34 +259,34 @@ def delete_account(payload: DeleteAccountRequest, authed_user_id: int = Depends(
 
     with db.transaction() as cur:
         cur.execute(
-            "UPDATE dashboards SET is_deleted = 1, deleted_at = SYSDATETIME(), is_shared = 0, "
+            "UPDATE dashboards SET is_deleted = 1, deleted_at = SYSUTCDATETIME(), is_shared = 0, "
             "share_token = NULL, shared_snapshot = NULL, shared_at = NULL "
             "WHERE user_id = %s AND is_deleted = 0",
             (authed_user_id,),
         )
         cur.execute(
-            "UPDATE sessions SET is_deleted = 1, deleted_at = SYSDATETIME() "
+            "UPDATE sessions SET is_deleted = 1, deleted_at = SYSUTCDATETIME() "
             "WHERE user_id = %s AND is_deleted = 0",
             (authed_user_id,),
         )
         cur.execute(
-            "UPDATE analyst_reports SET is_deleted = 1, deleted_at = SYSDATETIME(), "
+            "UPDATE analyst_reports SET is_deleted = 1, deleted_at = SYSUTCDATETIME(), "
             "is_shared = 0, share_token = NULL, shared_snapshot = NULL, shared_at = NULL "
             "WHERE user_id = %s AND is_deleted = 0",
             (authed_user_id,),
         )
         cur.execute(
-            "UPDATE table_info SET is_deleted = 1, deleted_at = SYSDATETIME() "
+            "UPDATE table_info SET is_deleted = 1, deleted_at = SYSUTCDATETIME() "
             "WHERE user_id = %s AND is_deleted = 0",
             (authed_user_id,),
         )
         cur.execute(
-            "UPDATE data_sources SET is_deleted = 1, deleted_at = SYSDATETIME(), status = 'revoked', "
+            "UPDATE data_sources SET is_deleted = 1, deleted_at = SYSUTCDATETIME(), status = 'revoked', "
             "secret_encrypted = '' WHERE user_id = %s AND is_deleted = 0",
             (authed_user_id,),
         )
         cur.execute(
-            "UPDATE auth SET is_deleted = 1, deleted_at = SYSDATETIME(), refresh_token = NULL, "
+            "UPDATE auth SET is_deleted = 1, deleted_at = SYSUTCDATETIME(), refresh_token = NULL, "
             "refresh_token_expires_at = NULL, email = LEFT(CONCAT('deleted+', id, '+', email), 255) "
             "WHERE id = %s",
             (authed_user_id,),

@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from core import db
 from core.security import get_current_user_id, require_same_user
+from core.timeutils import iso_utc
 from services import dataset_cleanup, pipeline
 
 logger = logging.getLogger("my_global_app_logger")
@@ -68,7 +69,7 @@ def session_info(sessionId: int, userId: int, authed_user_id: int = Depends(get_
                 "updated_columns": json.loads(row[4]) if row[4] else [],
                 "step_type": row[5],
                 "table": native_table,
-                "date_created": row[9].isoformat() if row[9] else None,
+                "date_created": iso_utc(row[9]),
             }
 
             source_session_id = row[6]
@@ -118,7 +119,7 @@ def get_user_sessions(userId: int, search: str = "", all_mode: bool = False, aut
         logger.debug("user_sessions: %s sessions for user %s", len(rows), userId)
         if not rows:
             return {"history": []}
-        return {"history": rows}
+        return {"history": [[r[0], r[1], iso_utc(r[2]), r[3]] for r in rows]}
     except Exception:
         logger.exception("Failed to list sessions for user %s", userId)
         raise HTTPException(status_code=500, detail="Couldn't load your sessions. Please try again.")
@@ -131,7 +132,7 @@ def update_session_metadata(session_id: int, user_id: int, session_title: str, a
     response = db.fetch(query=query, params=(session_id, user_id,))
     if response == []:
         raise HTTPException(status_code=400, detail="Session not found!")
-    query2 = "UPDATE sessions SET session_title = %s, date_modified = SYSDATETIME() WHERE session_id = %s AND user_id = %s"
+    query2 = "UPDATE sessions SET session_title = %s, date_modified = SYSUTCDATETIME() WHERE session_id = %s AND user_id = %s"
     db.run(query=query2, params=(session_title, session_id, user_id))
 
 
@@ -143,7 +144,7 @@ def delete_session(session_id: int, user_id: int, authed_user_id: int = Depends(
     if response == []:
         raise HTTPException(status_code=400, detail="Session not found!")
     table_id = response[0][2]
-    query2 = "UPDATE sessions SET is_deleted=1, deleted_at = SYSDATETIME() WHERE session_id = %s AND user_id = %s"
+    query2 = "UPDATE sessions SET is_deleted=1, deleted_at = SYSUTCDATETIME() WHERE session_id = %s AND user_id = %s"
     db.run(query=query2, params=(session_id, user_id))
     if table_id:
         remaining = db.get_single_value(
@@ -287,7 +288,7 @@ def rollback_transform(payload: RollbackRequest, authed_user_id: int = Depends(g
 
             placeholders = ", ".join(["%s"] * len(to_remove))
             cur.execute(
-                f"UPDATE queries SET is_deleted = 1, deleted_at = SYSDATETIME() WHERE id IN ({placeholders})",
+                f"UPDATE queries SET is_deleted = 1, deleted_at = SYSUTCDATETIME() WHERE id IN ({placeholders})",
                 tuple(to_remove),
             )
 

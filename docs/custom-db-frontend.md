@@ -32,7 +32,7 @@ client's remote data.
 - All endpoints require `Authorization: Bearer <access_token>`.
 - Every request body/query carries `userId`; it **must** match the token. A
   mismatch returns `401 {"detail": "User Mismatch"}`.
-- Response timestamps are ISO-8601 strings or `null`.
+- Response timestamps are UTC ISO-8601 strings (explicit `+00:00` / `Z` offset) or `null`.
 - Add/edit/delete of a connection does **not** consume AI tokens and does not
   count toward the monthly query quota.
 

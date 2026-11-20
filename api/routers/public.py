@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 
 from core import db
 from core.rate_limit import RateLimiter
+from core.timeutils import iso_utc
 
 logger = logging.getLogger("my_global_app_logger")
 router = APIRouter(tags=["public"])
@@ -38,7 +39,7 @@ def shared_dashboard(token: str):
         content={
             "dashboard_spec": snapshot.get("spec", {}),
             "data": snapshot.get("data", {}),
-            "shared_at": shared_at.isoformat() if shared_at else None,
+            "shared_at": iso_utc(shared_at),
         },
         headers={"Cache-Control": "no-store"},
     )
@@ -67,7 +68,7 @@ def shared_analyst_report(token: str):
     return JSONResponse(
         content={
             "report": snapshot,
-            "shared_at": shared_at.isoformat() if shared_at else None,
+            "shared_at": iso_utc(shared_at),
         },
         headers={"Cache-Control": "no-store"},
     )

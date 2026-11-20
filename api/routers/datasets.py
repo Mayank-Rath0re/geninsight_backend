@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from core import config, db
 from core.ai_trace import log_ai_event, new_trace_id
 from core.security import get_current_user_id, require_same_user
+from core.timeutils import iso_utc
 from services import upload_jobs, usage_service
 from services.custom_db import execution
 from services.table_ingest import ingest_table_and_session
@@ -35,7 +36,7 @@ def get_user_datasets(userId: int, authed_user_id: int = Depends(get_current_use
         if not output:
             return []
         return [
-            {"id": row[0], "name": row[1], "createdAt": row[2].isoformat() if row[2] else None}
+            {"id": row[0], "name": row[1], "createdAt": iso_utc(row[2])}
             for row in output
         ]
     except Exception:

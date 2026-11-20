@@ -84,12 +84,21 @@ def default_port(db_type: str) -> int:
 
 
 def extract_host(db_url: str) -> str:
-    """Accept either a bare hostname/IP or a URL such as mysql://host:3306/db."""
+    """Accept a bare hostname/IP, a host:port pair, or a URL such as mysql://host:3306/db."""
     value = (db_url or "").strip()
     if "://" in value:
         parsed = urlparse(value)
         if parsed.hostname:
             return parsed.hostname
+        return value
+    if value.startswith("["):
+        end = value.find("]")
+        if end != -1:
+            return value[1:end]
+    if value.count(":") == 1:
+        host, _, port = value.partition(":")
+        if port.isdigit():
+            return host
     return value
 
 
@@ -164,16 +173,30 @@ def apply_row_limit(sql: str, db_type: str, limit=None, offset: int = 0) -> str:
 
 _ALWAYS_BLOCKED = ("is_link_local", "is_multicast", "is_unspecified", "is_reserved")
 
+_SUPABASE_HINT = (
+    " If this is a Supabase project, note that its direct database host "
+    "(db.<project>.supabase.co) is IPv6-only; use the Session pooler host from the "
+    "Connect dialog in your Supabase dashboard instead "
+    "(aws-0-<region>.pooler.supabase.com, username postgres.<project>)."
+)
+
+
+def _resolve_host(host: str):
+    try:
+        return socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        hint = _SUPABASE_HINT if host.endswith(".supabase.co") else ""
+        raise ValueError(
+            f"Could not resolve database host '{host}'. Check the host name for typos.{hint}"
+        ) from exc
+
 
 def assert_host_allowed(host: str) -> None:
     """Reject hosts that could be used for SSRF against our own infrastructure."""
     if not host:
         raise ValueError("Database host is required.")
 
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror as exc:
-        raise ValueError(f"Could not resolve database host '{host}'.") from exc
+    infos = _resolve_host(host)
 
     for info in infos:
         address = info[4][0]

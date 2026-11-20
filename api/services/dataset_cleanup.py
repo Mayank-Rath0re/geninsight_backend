@@ -12,24 +12,24 @@ UNSAFE_TABLE_NAME = re.compile(r"[\[\]\x00-\x1f;]")
 
 def soft_delete_dataset(cur, table_id: int) -> None:
     cur.execute(
-        "UPDATE dashboards SET is_deleted = 1, deleted_at = SYSDATETIME(), is_shared = 0, "
+        "UPDATE dashboards SET is_deleted = 1, deleted_at = SYSUTCDATETIME(), is_shared = 0, "
         "share_token = NULL, shared_snapshot = NULL, shared_at = NULL "
         "WHERE table_id = %s AND is_deleted = 0",
         (table_id,),
     )
     cur.execute(
-        "UPDATE sessions SET is_deleted = 1, deleted_at = SYSDATETIME() "
+        "UPDATE sessions SET is_deleted = 1, deleted_at = SYSUTCDATETIME() "
         "WHERE table_id = %s AND is_deleted = 0",
         (table_id,),
     )
     cur.execute(
-        "UPDATE analyst_reports SET is_deleted = 1, deleted_at = SYSDATETIME(), is_shared = 0, "
+        "UPDATE analyst_reports SET is_deleted = 1, deleted_at = SYSUTCDATETIME(), is_shared = 0, "
         "share_token = NULL, shared_snapshot = NULL, shared_at = NULL "
         "WHERE table_id = %s AND is_deleted = 0",
         (table_id,),
     )
     cur.execute(
-        "UPDATE table_info SET is_deleted = 1, deleted_at = SYSDATETIME() WHERE id = %s",
+        "UPDATE table_info SET is_deleted = 1, deleted_at = SYSUTCDATETIME() WHERE id = %s",
         (table_id,),
     )
 

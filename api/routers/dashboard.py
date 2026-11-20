@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from core import db
 from core.ai_trace import log_ai_event, new_trace_id
 from core.security import get_current_user_id, require_same_user
+from core.timeutils import iso_utc as _iso
 from services import dashboard as dashboard_service
 from services import usage_service
 
@@ -20,9 +21,6 @@ router = APIRouter(tags=["dashboard"])
 #  - A generation/edit counts toward the Free monthly query cap only if it actually used the AI
 #    and succeeded (meter.llm_calls > 0).
 
-
-def _iso(value):
-    return value.isoformat() if value else None
 
 
 def _load_table_context(table_id: int):
@@ -171,7 +169,7 @@ def _dashboard_intent_basic_impl(payload: DashboardIntentBasicRequest, trace_id:
         if existing_id:
             db.run(
                 "UPDATE dashboards SET dashboard_intent = %s, user_response = NULL, prompt = %s, "
-                "updated_at = SYSDATETIME() WHERE dashboard_id = %s",
+                "updated_at = SYSUTCDATETIME() WHERE dashboard_id = %s",
                 (json.dumps(spec), prompt, existing_id),
             )
             dashboard_id = existing_id
@@ -265,7 +263,7 @@ def _update_dashboard_item_impl(payload: UpdateDashboardItemRequest, trace_id: s
                 )
 
         db.run(
-            "UPDATE dashboards SET dashboard_intent = %s, updated_at = SYSDATETIME() WHERE dashboard_id = %s",
+            "UPDATE dashboards SET dashboard_intent = %s, updated_at = SYSUTCDATETIME() WHERE dashboard_id = %s",
             (json.dumps(intent), payload.dashboard_id),
         )
         log_ai_event(trace_id, "dashboard.item_edit_done", item_id=payload.item_id, action=edit["action"])
@@ -468,7 +466,7 @@ def share_dashboard(payload: ShareDashboardRequest, authed_user_id: int = Depend
         token = token or secrets.token_urlsafe(24)
         db.run(
             "UPDATE dashboards SET is_shared = 1, share_token = %s, shared_snapshot = %s, "
-            "shared_at = SYSDATETIME(), dashboard_intent = %s WHERE dashboard_id = %s",
+            "shared_at = SYSUTCDATETIME(), dashboard_intent = %s WHERE dashboard_id = %s",
             (token, json.dumps(snapshot, default=str), json.dumps(spec), payload.dashboard_id),
         )
         log_ai_event(trace_id, "dashboard.share_enabled", dashboard_id=payload.dashboard_id,
@@ -519,7 +517,7 @@ def delete_dashboard(dashboard_id: int, userId: int, authed_user_id: int = Depen
     _check_dashboard_owner(dashboard_id, userId)
 
     db.run(
-        "UPDATE dashboards SET is_deleted = 1, deleted_at = SYSDATETIME(), is_shared = 0, "
+        "UPDATE dashboards SET is_deleted = 1, deleted_at = SYSUTCDATETIME(), is_shared = 0, "
         "share_token = NULL, shared_snapshot = NULL, shared_at = NULL WHERE dashboard_id = %s",
         (dashboard_id,),
     )
